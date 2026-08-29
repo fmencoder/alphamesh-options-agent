@@ -344,7 +344,7 @@ on every run.
 Checks:
 
 ```bash
-pytest        # 338 tests, no network, no LLM key
+pytest        # 350 tests, no network, no LLM key
 ruff check .
 mypy
 ```

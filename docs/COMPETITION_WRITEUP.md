@@ -159,7 +159,7 @@ QQQ BULL_CALL_SPREAD   LONG QQQ260903C00715000 (δ 0.5552)
 |---|---|
 | **Any order placed** | **No. Zero orders have been submitted to Alpaca.** |
 | **P&L** | **None. No trade has been opened or closed, so there is no P&L to report.** |
-| Alpaca REST from the Python runtime | Not exercised. The build container's network policy returns HTTP 403 at CONNECT for `paper-api.alpaca.markets` and `data.alpaca.markets`, so the REST client could not be run here. Its code path is unit-tested but not network-tested. |
+| Alpaca REST from the Python runtime | Not exercised over the network. The build container's network policy returns HTTP 403 at CONNECT for `paper-api.alpaca.markets` and `data.alpaca.markets`. Request construction and the alpaca-py→domain mapping are unit-tested against stubbed clients (`tests/test_rest_adapters.py`); the sockets themselves are not. |
 | Alpaca CLI execution | No CLI binary is installed in this environment. The adapter reports unavailable rather than simulating output. |
 | Live-market behaviour | The captured session is a quiet Friday afternoon. The agent correctly declined to trade it. |
 | Railway deployment | `Dockerfile`, `railway.json` and `Procfile` are written and `alphamesh health` works locally, exiting non-zero when the paper guard fails. The image has **not** been built: no Docker daemon is available in this environment. No deploy has been performed. |
@@ -187,7 +187,7 @@ circuit-breaker exits and correlated-exposure gating.
 
 ### Quality gates
 
-- **338 tests pass.** No network access, no LLM key, no Alpaca credentials
+- **350 tests pass.** No network access, no LLM key, no Alpaca credentials
   required.
 - **`ruff check` clean.**
 - **`mypy` clean** across 49 source files with `disallow_untyped_defs`.

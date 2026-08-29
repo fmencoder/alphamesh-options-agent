@@ -60,7 +60,7 @@ class TestDataEndpoint:
 
 class TestAccountNumber:
     def test_paper_prefix_accepted(self) -> None:
-        check_account_number("PA3D6YAUG6DT")
+        check_account_number("PA0000EXAMPLE")
 
     @pytest.mark.parametrize("value", ["", "  ", "920123456", "LIVE12345", "XA000001"])
     def test_non_paper_account_rejected(self, value: str) -> None:

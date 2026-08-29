@@ -73,8 +73,8 @@ class TestRedaction:
         assert "SPY" in stored
 
     def test_account_number_is_never_journalled(self, journal) -> None:  # type: ignore[no-untyped-def]
-        journal.record_event("account", {"account_number": "PA3D6YAUG6DT"})
-        assert "PA3D6YAUG6DT" not in journal.recent_events(1)[0]["payload"]
+        journal.record_event("account", {"account_number": "PA0000EXAMPLE"})
+        assert "PA0000EXAMPLE" not in journal.recent_events(1)[0]["payload"]
 
 
 class TestDecisionPersistence:

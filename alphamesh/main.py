@@ -23,6 +23,7 @@ import sys
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import FrameType
 from typing import Any
 
@@ -216,6 +217,14 @@ def cmd_replay_session(config: AppConfig, args: argparse.Namespace) -> int:
         print("replay-session requires ALPHAMESH_DATA_SOURCE=mcp_capture", file=sys.stderr)
         return 2
 
+    # Simulated fills must never land in the journal a judge reads for P&L, so
+    # this command always writes to its own database beside the real one.
+    real_db = Path(config.settings.database_path)
+    replay_db = real_db.with_name(f"{real_db.stem}.replay{real_db.suffix or '.db'}")
+    config = config.model_copy(
+        update={"settings": config.settings.model_copy(update={"database_path": replay_db})}
+    )
+
     overrides: dict[str, float] = {}
     if args.threshold is not None:
         overrides["quant_score_threshold"] = float(args.threshold)
@@ -231,6 +240,7 @@ def cmd_replay_session(config: AppConfig, args: argparse.Namespace) -> int:
     print("  SIMULATED WALK-FORWARD REPLAY OVER CAPTURED ALPACA DATA")
     print("  Fills come from the in-process simulator. Any P&L below is")
     print("  SIMULATED and is NOT Alpaca paper account P&L.")
+    print(f"  journal: {replay_db}  (kept separate from the live journal)")
     print(f"  quant_score_threshold  = {config.strategies.quant_score_threshold}")
     print(f"  min_judge_confidence   = {config.strategies.min_judge_confidence}")
     print("=" * 72)

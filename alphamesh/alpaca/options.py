@@ -144,10 +144,11 @@ class AlpacaRestOptionChain:
         from datetime import timedelta
 
         from alpaca.data.requests import OptionChainRequest
+        from alpaca.trading.enums import ContractType
 
         request = OptionChainRequest(
             underlying_symbol=underlying,
-            type=option_type.value,
+            type=ContractType(option_type.value),
             expiration_date_gte=as_of + timedelta(days=min_dte),
             expiration_date_lte=as_of + timedelta(days=max_dte),
         )

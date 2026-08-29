@@ -187,6 +187,10 @@ class AlpacaRestMarketData:
 
         client = TradingClient(self._api_key, self._api_secret, paper=True)
         clock = client.get_clock()
+        # alpaca-py types this as ``Clock | dict``; the raw-dict branch only
+        # occurs for a raw-data client, which we never construct.
+        if isinstance(clock, dict):
+            raise MarketDataUnavailableError("Alpaca returned an untyped clock payload")
         return MarketClock(
             timestamp=clock.timestamp,
             is_open=bool(clock.is_open),
