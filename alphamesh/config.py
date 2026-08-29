@@ -53,10 +53,12 @@ class Settings(BaseModel):
     llm_model: str = "claude-sonnet-5"
     database_path: Path = PROJECT_ROOT / "data" / "alphamesh.db"
     loop_seconds: int = 60
+    closed_poll_seconds: int = 300
     dry_run: bool = True
     log_level: str = "INFO"
     data_source: str = "rest"
     capture_dir: Path = PROJECT_ROOT / "data" / "mcp_capture"
+    capture_market_open: bool = True
     alpaca_cli_path: str = "alpaca"
 
     @property
@@ -80,6 +82,7 @@ class Settings(BaseModel):
             "data_source": self.data_source,
             "dry_run": self.dry_run,
             "loop_seconds": self.loop_seconds,
+            "closed_poll_seconds": self.closed_poll_seconds,
         }
 
 
@@ -97,10 +100,12 @@ def load_settings() -> Settings:
         llm_model=_env("ALPHAMESH_LLM_MODEL") or "claude-sonnet-5",
         database_path=Path(db),
         loop_seconds=_env_int("ALPHAMESH_LOOP_SECONDS", 60),
+        closed_poll_seconds=_env_int("ALPHAMESH_CLOSED_POLL_SECONDS", 300),
         dry_run=_env_bool("ALPHAMESH_DRY_RUN", True),
         log_level=_env("ALPHAMESH_LOG_LEVEL") or "INFO",
         data_source=(_env("ALPHAMESH_DATA_SOURCE") or "rest").lower(),
         capture_dir=Path(cap),
+        capture_market_open=_env_bool("ALPHAMESH_CAPTURE_MARKET_OPEN", True),
         alpaca_cli_path=_env("ALPACA_CLI_PATH") or "alpaca",
     )
 

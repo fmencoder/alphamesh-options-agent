@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import logging
 import uuid
-from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
@@ -24,6 +23,7 @@ from alphamesh.agents.regime_agent import RegimeAgent
 from alphamesh.agents.strategy_agent import CouncilResult, StrategyAgent
 from alphamesh.alpaca.client import AlpacaStack
 from alphamesh.alpaca.execution import AmbiguousSubmissionError, BrokerError
+from alphamesh.alpaca.types import MarketClock
 from alphamesh.config import AppConfig
 from alphamesh.execution.exits import evaluate_exit
 from alphamesh.execution.monitor import (
@@ -57,6 +57,7 @@ from alphamesh.persistence.journal import Journal
 from alphamesh.risk.circuit_breaker import evaluate_circuit_breaker
 from alphamesh.risk.governor import RiskGovernor
 from alphamesh.risk.portfolio import PortfolioState
+from alphamesh.safety import LiveTradingForbiddenError, check_trading_endpoint
 from alphamesh.strategies.bear_put import build_bear_put_spread
 from alphamesh.strategies.bull_call import build_bull_call_spread
 
@@ -68,6 +69,9 @@ class CycleReport:
     """Everything that happened in one pass, for logs and the dashboard."""
 
     started_at: datetime
+    market_open: bool = True
+    next_open: datetime | None = None
+    execution_mode: str = "UNKNOWN"
     symbols_scanned: int = 0
     decisions: list[TradeDecision] = field(default_factory=list)
     orders_submitted: list[str] = field(default_factory=list)
@@ -79,6 +83,9 @@ class CycleReport:
     def as_dict(self) -> dict[str, object]:
         return {
             "started_at": self.started_at.isoformat(),
+            "market_open": self.market_open,
+            "next_open": self.next_open.isoformat() if self.next_open else None,
+            "execution_mode": self.execution_mode,
             "symbols_scanned": self.symbols_scanned,
             "decisions": [
                 {
@@ -116,6 +123,7 @@ class Orchestrator:
         self.governor = RiskGovernor(config.risk, paper_confirmed=stack.guard.paper)
         self.monitor = OrderMonitor(stack.broker, journal)
         self._regimes: dict[str, RegimeAssessment] = {}
+        self._clock: MarketClock | None = None
 
     # ------------------------------------------------------------- lifecycle
     def startup(self) -> dict[str, object]:
@@ -129,6 +137,16 @@ class Orchestrator:
             report.orphaned,
         )
         return report.as_dict()
+
+    def market_clock(self) -> MarketClock | None:
+        """Read the trading calendar. ``None`` means it could not be read, which
+        callers must treat as closed rather than as open."""
+        try:
+            self._clock = self.stack.market_data.clock()
+        except Exception as exc:
+            log.warning("could not read the market clock: %s", exc)
+            self._clock = None
+        return self._clock
 
     def portfolio_state(self, now: datetime | None = None) -> PortfolioState:
         account = self.stack.broker.account()
@@ -194,7 +212,29 @@ class Orchestrator:
         deterministically; production passes ``None`` and uses the wall clock.
         """
         now = now or datetime.now(UTC)
-        report = CycleReport(started_at=now)
+        report = CycleReport(started_at=now, execution_mode=self.stack.execution_mode)
+
+        # Market-hours gate, before any other work. A closed market means every
+        # quote is dead, so scanning, invoking the AI council and pulling option
+        # chains would burn cost on data that cannot be traded. A clock we
+        # cannot read is treated as closed: fail closed, never open.
+        clock = self.market_clock()
+        if clock is None:
+            report.market_open = False
+            report.errors.append("market clock unavailable; treating the market as closed")
+            self.journal.record_event("market_closed", {"reason": "clock_unavailable"})
+            return report
+        report.market_open = bool(clock.is_open)
+        report.next_open = clock.next_open
+        if not clock.is_open:
+            self.journal.record_event(
+                "market_closed",
+                {
+                    "next_open": clock.next_open.isoformat() if clock.next_open else None,
+                    "execution_mode": report.execution_mode,
+                },
+            )
+            return report
 
         try:
             portfolio = self.portfolio_state(now)
@@ -379,6 +419,25 @@ class Orchestrator:
             )
             return
 
+        # Final paper revalidation, immediately before the only call in the
+        # system that can create a position. The startup guard and the
+        # cycle-level account read both happened earlier; this closes the gap
+        # between them and the wire.
+        try:
+            self._assert_paper_before_submit()
+        except LiveTradingForbiddenError as exc:
+            self.journal.set_order_state(
+                intent.client_order_id, TradeState.REJECTED, f"paper recheck failed: {exc.detail}"
+            )
+            self.journal.record_event(
+                "live_trading_blocked",
+                {"client_order_id": intent.client_order_id, "detail": exc.detail},
+                decision_id=decision.decision_id,
+                symbol=decision.symbol,
+            )
+            report.rejections.append((decision.symbol, (ReasonCode.LIVE_TRADING_FORBIDDEN,)))
+            return
+
         try:
             record = self.stack.broker.submit_spread(intent)
         except AmbiguousSubmissionError as exc:
@@ -408,6 +467,15 @@ class Orchestrator:
         refreshed = self.monitor.refresh(intent.client_order_id) or record
         if refreshed.filled_quantity > 0:
             self._open_position(decision, intent, refreshed, risk, now)
+
+    def _assert_paper_before_submit(self) -> None:
+        """Re-prove paper mode at the wire. Raises rather than returning."""
+        if not self.stack.guard.paper:
+            raise LiveTradingForbiddenError("startup paper guard is not satisfied")
+        check_trading_endpoint(self.config.settings.base_url)
+        # AlpacaPaperBroker.account() re-checks the PA account prefix on every
+        # call and raises if it is absent.
+        self.stack.broker.account()
 
     def _open_position(
         self,
@@ -459,6 +527,7 @@ class Orchestrator:
                 "quantity": position.quantity,
                 "entry_debit_cents": entry_debit,
                 "max_loss_cents": position.max_loss_cents,
+                "execution_mode": self.stack.execution_mode,
             },
             decision_id=decision.decision_id,
             symbol=decision.symbol,
@@ -472,11 +541,8 @@ class Orchestrator:
         breaker_tripped: bool,
         report: CycleReport,
     ) -> None:
-        clock = None
-        with suppress(Exception):
-            # A clock outage only costs us the session-close exit; the
-            # time-based and mark-based rules still run without it.
-            clock = self.stack.market_data.clock()
+        # Reuse the clock already read by run_cycle's market-hours gate.
+        clock = self._clock
 
         for position in portfolio.open_positions:
             mark = self._mark_for(position, now)

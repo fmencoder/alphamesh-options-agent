@@ -50,6 +50,12 @@ class AlpacaStack:
     broker: Broker
     live_broker: bool
 
+    @property
+    def execution_mode(self) -> str:
+        """``ALPACA_PAPER`` or ``SIMULATED``. Journalled so a simulated fill can
+        never be mistaken for a real one after the fact."""
+        return "ALPACA_PAPER" if self.live_broker else "SIMULATED"
+
 
 def build_stack(settings: Settings) -> AlpacaStack:
     """Construct the data and execution stack for the configured mode.
@@ -62,7 +68,9 @@ def build_stack(settings: Settings) -> AlpacaStack:
     guard = enforce_paper_mode(settings)
 
     if settings.data_source == "mcp_capture":
-        market_data: MarketDataProvider = CaptureMarketData(settings.capture_dir)
+        market_data: MarketDataProvider = CaptureMarketData(
+            settings.capture_dir, market_open=settings.capture_market_open
+        )
         option_chain: OptionChainProvider = CaptureOptionChain(settings.capture_dir)
     elif settings.has_credentials:
         market_data = AlpacaRestMarketData(settings.api_key_id, settings.api_secret_key)
@@ -73,15 +81,31 @@ def build_stack(settings: Settings) -> AlpacaStack:
             "APCA_API_SECRET_KEY. Set them, or use ALPHAMESH_DATA_SOURCE=mcp_capture."
         )
 
-    if settings.dry_run or not settings.has_credentials:
+    if not settings.dry_run and not settings.has_credentials:
+        # Fail closed. Silently simulating here would write fabricated fills
+        # into the journal that a judge reads for P&L, indistinguishable from
+        # real ones. Refusing to start is the only safe answer.
+        raise RuntimeError(
+            "ALPHAMESH_DRY_RUN=false requires APCA_API_KEY_ID and "
+            "APCA_API_SECRET_KEY. Refusing to start: without them AlphaMesh "
+            "would simulate fills while presenting them as real."
+        )
+
+    if settings.dry_run:
         broker: Broker = SimulatedBroker(SIMULATED_ACCOUNT)
         live_broker = False
-        log.info("dry run: using the in-process simulated broker, no orders will be sent")
+        log.warning(
+            "EXECUTION MODE: SIMULATED. ALPHAMESH_DRY_RUN is true, so fills are "
+            "generated in-process and NO order reaches Alpaca. Any P&L recorded "
+            "in this journal is SIMULATED. Set ALPHAMESH_DRY_RUN=false for the "
+            "competition account."
+        )
     else:
         broker = AlpacaPaperBroker(
             settings.api_key_id, settings.api_secret_key, settings.base_url
         )
         live_broker = True
+        log.info("EXECUTION MODE: ALPACA PAPER via %s", settings.base_url)
 
     return AlpacaStack(
         guard=guard,
