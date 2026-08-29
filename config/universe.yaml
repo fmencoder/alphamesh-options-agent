@@ -1,0 +1,12 @@
+# Trading universe for v1. Deliberately narrow: both symbols are deeply liquid
+# index ETFs with penny-wide option markets. Do not broaden until the core
+# lifecycle is proven.
+symbols:
+  - SPY
+  - QQQ
+
+# Minimum 1-minute bars required before features are considered valid.
+min_bars_required: 60
+
+# Bars pulled per evaluation cycle.
+bar_lookback_minutes: 180

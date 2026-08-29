@@ -1,0 +1,48 @@
+# Strategy and contract-selection parameters.
+
+# Quantitative opportunity gate. The AI reasoning council is only invoked when
+# the deterministic quant score clears this threshold, so the agent does not
+# burn LLM calls on every tick.
+quant_score_threshold: 0.55
+
+# Judge confidence floor. Below this the decision is downgraded to NO_TRADE.
+min_judge_confidence: 0.55
+
+# Days to expiration window for v1.
+min_dte: 2
+max_dte: 10
+
+# Target deltas. Selection picks the closest eligible contract; an exact match
+# is never required.
+bull_call_spread:
+  long_delta_target: 0.55
+  long_delta_range: [0.45, 0.65]
+  short_delta_target: 0.30
+  short_delta_range: [0.20, 0.40]
+  min_strike_width: 1.0
+  max_strike_width: 15.0
+
+bear_put_spread:
+  long_delta_target: -0.55
+  long_delta_range: [-0.65, -0.45]
+  short_delta_target: -0.30
+  short_delta_range: [-0.40, -0.20]
+  min_strike_width: 1.0
+  max_strike_width: 15.0
+
+# Debit spread must keep some upside: reject when the net debit consumes more
+# than this fraction of the strike width (i.e. reward/risk gets too poor).
+max_debit_to_width_ratio: 0.70
+
+# Limit order pricing: fraction of the way from mid toward the natural
+# (marketable) price. 0.0 = mid, 1.0 = pay the full spread.
+limit_price_aggressiveness: 0.35
+
+# Exit management.
+exits:
+  profit_target_pct_of_max_profit: 0.55
+  max_loss_pct_of_defined_risk: 0.65
+  max_holding_minutes: 900
+  signal_invalidation_regime_flip: true
+  flatten_before_close_minutes: 20
+  allow_overnight: false

@@ -1,0 +1,47 @@
+"""Aggregate portfolio risk state used by the Risk Governor."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+from alphamesh.alpaca.types import AccountState
+from alphamesh.config import RiskLimits
+from alphamesh.models.domain import PositionRecord
+
+
+@dataclass(frozen=True)
+class PortfolioState:
+    """A snapshot of everything the governor needs to reason about exposure."""
+
+    account: AccountState
+    open_positions: tuple[PositionRecord, ...] = ()
+    realized_pnl_today_cents: int = 0
+    unrealized_pnl_cents: int = 0
+    open_client_order_ids: frozenset[str] = field(default_factory=frozenset)
+
+    @property
+    def open_position_count(self) -> int:
+        return len(self.open_positions)
+
+    @property
+    def total_defined_risk_cents(self) -> int:
+        return sum(p.max_loss_cents for p in self.open_positions)
+
+    @property
+    def session_pnl_cents(self) -> int:
+        """Realised plus unrealised profit and loss for the session."""
+        return self.realized_pnl_today_cents + self.unrealized_pnl_cents
+
+    def positions_in_group(self, limits: RiskLimits, group: str | None) -> list[PositionRecord]:
+        if group is None:
+            return []
+        return [p for p in self.open_positions if limits.group_for(p.symbol) == group]
+
+    def defined_risk_in_group_cents(self, limits: RiskLimits, group: str | None) -> int:
+        return sum(p.max_loss_cents for p in self.positions_in_group(limits, group))
+
+    def has_open_position_for(self, symbol: str) -> bool:
+        return any(p.symbol.upper() == symbol.upper() for p in self.open_positions)
+
+
+__all__ = ["PortfolioState"]
