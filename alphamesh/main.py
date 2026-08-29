@@ -79,10 +79,98 @@ def _build(config: AppConfig) -> tuple[Orchestrator, Journal]:
 # --------------------------------------------------------------------------- #
 # Subcommands
 # --------------------------------------------------------------------------- #
+def _interruptible_sleep(seconds: float) -> None:
+    """Sleep in short slices so SIGTERM is honoured promptly.
+
+    Railway sends SIGTERM and then SIGKILLs after a grace period; a long
+    uninterruptible sleep would be killed mid-cycle instead of shutting down.
+    """
+    deadline = time.monotonic() + seconds
+    while not _SHUTDOWN:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(1.0, remaining))
+
+
+def _closed_market_wait(report: Any, closed_interval: int) -> float:
+    """Seconds to wait while closed: the backoff, but never past the next open."""
+    if report.next_open is None:
+        return float(closed_interval)
+    until_open = (report.next_open - datetime.now(UTC)).total_seconds()
+    if until_open <= 0:
+        return float(min(closed_interval, 60))
+    return float(max(5.0, min(closed_interval, until_open)))
+
+
+class OrderSubmissionForbiddenError(RuntimeError):
+    """Raised if anything in preflight tries to place an order."""
+
+
+class _ZeroOrderBroker:
+    """Read-only proxy around a broker.
+
+    Preflight is run against the real competition account, so "it places no
+    orders" must be structural rather than a promise. Every read is forwarded;
+    every write raises.
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+
+    def account(self) -> Any:
+        return self._inner.account()
+
+    def positions(self) -> Any:
+        return self._inner.positions()
+
+    def get_order_by_client_id(self, client_order_id: str) -> Any:
+        return self._inner.get_order_by_client_id(client_order_id)
+
+    def submit_spread(self, *_a: Any, **_k: Any) -> Any:
+        raise OrderSubmissionForbiddenError("preflight must never submit an order")
+
+    def close_spread(self, *_a: Any, **_k: Any) -> Any:
+        raise OrderSubmissionForbiddenError("preflight must never close a position")
+
+    def cancel_order(self, *_a: Any, **_k: Any) -> Any:
+        raise OrderSubmissionForbiddenError("preflight must never cancel an order")
+
+
+# Checks whose failure makes autonomous execution unsafe or impossible.
+EXECUTION_CRITICAL = (
+    "PREFLIGHT_PAPER_MODE",
+    "PREFLIGHT_ACCOUNT",
+    "PREFLIGHT_MARKET_DATA",
+    "PREFLIGHT_OPTIONS_CHAIN",
+    "PREFLIGHT_GREEKS",
+    "PREFLIGHT_JOURNAL",
+    "PREFLIGHT_RECOVERY",
+)
+
+
 def cmd_preflight(config: AppConfig) -> int:
-    """Report on safety, configuration and reachability. Never places an order."""
+    """Authoritative readiness report. Places ZERO orders, structurally.
+
+    Exits non-zero when any execution-critical dependency fails, so it can gate
+    a deploy or a start script.
+    """
+    from alphamesh.models.domain import OptionType
+
     print(banner(config.settings))
-    result: dict[str, Any] = {
+
+    flags: dict[str, str] = {
+        "PREFLIGHT_PAPER_MODE": "FAIL",
+        "PREFLIGHT_ACCOUNT": "FAIL",
+        "PREFLIGHT_MARKET_DATA": "FAIL",
+        "PREFLIGHT_OPTIONS_CHAIN": "FAIL",
+        "PREFLIGHT_GREEKS": "FAIL",
+        "PREFLIGHT_JOURNAL": "FAIL",
+        "PREFLIGHT_RECOVERY": "FAIL",
+        "PREFLIGHT_AI_PROVIDER": "FAIL",
+        "PREFLIGHT_READY": "NO",
+    }
+    detail: dict[str, Any] = {
         "version": __version__,
         "settings": config.settings.redacted(),
         "risk_limits": {
@@ -95,57 +183,90 @@ def cmd_preflight(config: AppConfig) -> int:
             "allowed_strategies": config.risk.allowed_strategies,
         },
         "universe": config.universe.symbols,
+        "orders_submitted": 0,
     }
 
+    # ---------------------------------------------------------- paper mode
     try:
         stack = build_stack(config.settings)
     except LiveTradingForbiddenError as exc:
-        result["paper_guard"] = {"passed": False, "detail": exc.detail}
-        print(json.dumps(result, indent=2))
-        print("\nPREFLIGHT FAILED: paper mode could not be established.", file=sys.stderr)
-        return 2
+        detail["paper_guard"] = {"passed": False, "detail": exc.detail}
+        return _emit_preflight(detail, flags, exit_code=2)
     except Exception as exc:
-        result["stack"] = {"built": False, "error": str(exc)}
-        print(json.dumps(result, indent=2))
-        return 3
+        detail["stack"] = {"built": False, "error": str(exc)}
+        return _emit_preflight(detail, flags, exit_code=3)
 
-    result["paper_guard"] = {"passed": True, "checks": list(stack.guard.checks)}
-    result["broker"] = {
-        "live_broker": stack.live_broker,
-        "kind": type(stack.broker).__name__,
-    }
+    flags["PREFLIGHT_PAPER_MODE"] = "PASS"
+    detail["paper_guard"] = {"passed": True, "checks": list(stack.guard.checks)}
+    detail["execution_mode"] = stack.execution_mode
+    detail["broker"] = {"live_broker": stack.live_broker, "kind": type(stack.broker).__name__}
+    if not stack.live_broker:
+        detail["execution_mode_warning"] = (
+            "SIMULATED: ALPHAMESH_DRY_RUN is true, so no order would reach Alpaca "
+            "and any P&L recorded would be simulated."
+        )
 
+    broker = _ZeroOrderBroker(stack.broker)
+
+    # ------------------------------------------------------------- account
     try:
-        account = stack.broker.account()
-        result["account"] = {
+        account = broker.account()
+        tradeable = account.is_tradeable and account.options_trading_level >= 3
+        detail["account"] = {
             "paper_prefix_verified": True,
             "status": account.status,
-            "equity": account.equity,
+            "active": account.status.upper() == "ACTIVE",
+            "trading_blocked": account.trading_blocked,
+            "account_blocked": account.account_blocked,
             "options_trading_level": account.options_trading_level,
+            "equity": account.equity,
+            "buying_power": account.buying_power,
             "options_buying_power": account.options_buying_power,
-            "tradeable": account.is_tradeable,
+            "tradeable": tradeable,
+        }
+        flags["PREFLIGHT_ACCOUNT"] = "PASS" if tradeable else "FAIL"
+    except Exception as exc:
+        detail["account"] = {"reachable": False, "error": str(exc)}
+
+    # --------------------------------------------------------------- clock
+    try:
+        clock = stack.market_data.clock()
+        detail["clock"] = {
+            "is_open": clock.is_open,
+            "timestamp": clock.timestamp.isoformat(),
+            "next_open": clock.next_open.isoformat() if clock.next_open else None,
+            "next_close": clock.next_close.isoformat() if clock.next_close else None,
         }
     except Exception as exc:
-        result["account"] = {"reachable": False, "error": str(exc)}
+        detail["clock"] = {"reachable": False, "error": str(exc)}
 
+    # --------------------------------------------------------- market data
     market: dict[str, Any] = {}
+    market_ok = True
     for symbol in config.universe.symbols:
         try:
             snapshot = stack.market_data.snapshot(
                 symbol, lookback_minutes=config.universe.bar_lookback_minutes
             )
+            enough = snapshot.bar_count >= config.universe.min_bars_required
             market[symbol] = {
                 "bars": snapshot.bar_count,
+                "min_required": config.universe.min_bars_required,
+                "sufficient": enough,
                 "last_price": snapshot.last_price,
                 "as_of": snapshot.as_of.isoformat(),
             }
+            market_ok = market_ok and enough
         except Exception as exc:
             market[symbol] = {"error": str(exc)}
-    result["market_data"] = market
+            market_ok = False
+    detail["market_data"] = market
+    flags["PREFLIGHT_MARKET_DATA"] = "PASS" if market_ok and market else "FAIL"
 
+    # -------------------------------------------------------- option chain
     chains: dict[str, Any] = {}
-    from alphamesh.models.domain import OptionType
-
+    chain_ok = True
+    greeks_ok = True
     for symbol in config.universe.symbols:
         for option_type in (OptionType.CALL, OptionType.PUT):
             key = f"{symbol}:{option_type.value}"
@@ -157,17 +278,93 @@ def cmd_preflight(config: AppConfig) -> int:
                     min_dte=config.strategies.min_dte,
                     max_dte=config.strategies.max_dte,
                 )
+                with_greeks = sum(1 for c in chain if c.greeks.delta is not None)
+                with_quotes = sum(
+                    1 for c in chain if c.quote is not None and c.quote.bid > 0
+                )
                 chains[key] = {
                     "contracts": len(chain),
-                    "with_greeks": sum(1 for c in chain if c.greeks.delta is not None),
-                    "with_quotes": sum(1 for c in chain if c.quote is not None),
+                    "with_greeks": with_greeks,
+                    "with_usable_quotes": with_quotes,
                 }
+                chain_ok = chain_ok and len(chain) > 0
+                greeks_ok = greeks_ok and with_greeks > 0 and with_quotes > 0
             except Exception as exc:
                 chains[key] = {"error": str(exc)}
-    result["option_chains"] = chains
+                chain_ok = False
+                greeks_ok = False
+    detail["option_chains"] = chains
+    flags["PREFLIGHT_OPTIONS_CHAIN"] = "PASS" if chain_ok and chains else "FAIL"
+    flags["PREFLIGHT_GREEKS"] = "PASS" if greeks_ok and chains else "FAIL"
 
-    print(json.dumps(result, indent=2))
-    return 0
+    # ------------------------------------------------- journal and recovery
+    journal: Journal | None = None
+    try:
+        journal = Journal(config.settings.database_path)
+        journal.record_event("preflight", {"version": __version__})
+        detail["journal"] = {
+            "path": str(config.settings.database_path),
+            "writable": True,
+            "open_positions": len(journal.open_positions()),
+            "closed_trades": len(journal.outcomes()),
+            "open_orders": len(journal.open_orders()),
+        }
+        flags["PREFLIGHT_JOURNAL"] = "PASS"
+    except Exception as exc:
+        detail["journal"] = {"writable": False, "error": str(exc)}
+
+    if journal is not None:
+        try:
+            provider = build_provider(
+                config.settings.anthropic_api_key, config.settings.llm_model
+            )
+            probe = Orchestrator(config, stack, journal, provider)
+            probe.stack.broker = broker  # type: ignore[assignment]
+            recovery = probe.startup()
+            detail["recovery"] = recovery
+            flags["PREFLIGHT_RECOVERY"] = "PASS"
+        except Exception as exc:
+            detail["recovery"] = {"error": str(exc)}
+        finally:
+            journal.close()
+
+    # --------------------------------------------------------- AI provider
+    provider = build_provider(config.settings.anthropic_api_key, config.settings.llm_model)
+    detail["ai_provider"] = {
+        "provider": provider.name,
+        "available": provider.available(),
+        "model": config.settings.llm_model if provider.available() else None,
+        "fallback": "deterministic heuristic council",
+        "note": (
+            "No key configured: the council runs on deterministic heuristics. "
+            "The agent still trades."
+            if not provider.available()
+            else "LLM council active; heuristics remain the fallback."
+        ),
+    }
+    # The heuristic fallback is always present, so this check passes either way;
+    # it reports which path is live rather than gating on the LLM.
+    flags["PREFLIGHT_AI_PROVIDER"] = "PASS"
+
+    failed = [k for k in EXECUTION_CRITICAL if flags[k] != "PASS"]
+    detail["failed_critical_checks"] = failed
+    flags["PREFLIGHT_READY"] = "YES" if not failed else "NO"
+    return _emit_preflight(detail, flags, exit_code=0 if not failed else 1)
+
+
+def _emit_preflight(detail: dict[str, Any], flags: dict[str, str], exit_code: int) -> int:
+    """Print the human report then the machine-readable flag block."""
+    print(json.dumps(detail, indent=2, default=str))
+    print()
+    for key, value in flags.items():
+        print(f"{key}={value}")
+    if exit_code != 0:
+        print(
+            f"\nPREFLIGHT NOT READY (exit {exit_code}): "
+            f"{', '.join(detail.get('failed_critical_checks') or ['paper mode'])}",
+            file=sys.stderr,
+        )
+    return exit_code
 
 
 def cmd_replay(config: AppConfig) -> int:
@@ -329,28 +526,42 @@ def cmd_run(config: AppConfig) -> int:
 
     orchestrator, journal = _build(config)
     interval = max(5, config.settings.loop_seconds)
-    log.info("autonomous loop starting; interval=%ss", interval)
+    closed_interval = max(interval, config.settings.closed_poll_seconds)
+    log.info(
+        "autonomous loop starting; open=%ss closed=%ss mode=%s",
+        interval,
+        closed_interval,
+        orchestrator.stack.execution_mode,
+    )
     try:
         orchestrator.startup()
         while not _SHUTDOWN:
             started = time.monotonic()
+            wait: float = float(interval)
             try:
                 report = orchestrator.run_cycle()
-                log.info(
-                    "cycle: scanned=%d orders=%d exits=%d rejections=%d errors=%d",
-                    report.symbols_scanned,
-                    len(report.orders_submitted),
-                    len(report.exits_taken),
-                    len(report.rejections),
-                    len(report.errors),
-                )
+                if report.market_open:
+                    log.info(
+                        "cycle: scanned=%d orders=%d exits=%d rejections=%d errors=%d",
+                        report.symbols_scanned,
+                        len(report.orders_submitted),
+                        len(report.exits_taken),
+                        len(report.rejections),
+                        len(report.errors),
+                    )
+                else:
+                    # Closed market: back off hard rather than re-scanning dead
+                    # quotes every interval. Never sleep past the next open.
+                    wait = _closed_market_wait(report, closed_interval)
+                    log.info(
+                        "market closed; next open %s, sleeping %ss",
+                        report.next_open.isoformat() if report.next_open else "unknown",
+                        wait,
+                    )
             except Exception:
                 log.exception("cycle failed; continuing")
             elapsed = time.monotonic() - started
-            for _ in range(int(max(0.0, interval - elapsed))):
-                if _SHUTDOWN:
-                    break
-                time.sleep(1)
+            _interruptible_sleep(max(0.0, wait - elapsed))
     finally:
         journal.close()
         log.info("autonomous loop stopped")

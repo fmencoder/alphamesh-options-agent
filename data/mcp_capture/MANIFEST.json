@@ -16,32 +16,78 @@
     "note": "Account number prefix PA denotes an Alpaca PAPER account. Full account number intentionally not committed."
   },
   "underlying_reference_prices": {
-    "SPY": {"last_trade": 769.28, "daily_close": 769.28, "source_tool": "get_stock_snapshot"},
-    "QQQ": {"last_trade": 716.91, "daily_close": 716.44, "source_tool": "get_stock_snapshot"}
+    "SPY": {
+      "last_trade": 769.28,
+      "daily_close": 769.28,
+      "source_tool": "get_stock_snapshot"
+    },
+    "QQQ": {
+      "last_trade": 716.91,
+      "daily_close": 716.44,
+      "source_tool": "get_stock_snapshot"
+    }
   },
   "files": [
     {
       "path": "bars_1min_SPY_2026-08-28.csv",
       "source_tool": "get_stock_bars",
-      "params": {"symbols": "SPY,QQQ", "timeframe": "1Min", "start": "2026-08-28T17:00:00Z", "end": "2026-08-28T20:00:00Z", "feed": "sip"},
+      "params": {
+        "symbols": "SPY,QQQ",
+        "timeframe": "1Min",
+        "start": "2026-08-28T17:00:00Z",
+        "end": "2026-08-28T20:00:00Z",
+        "feed": "sip"
+      },
       "rows": 180
     },
     {
       "path": "bars_1min_QQQ_2026-08-28.csv",
       "source_tool": "get_stock_bars",
-      "params": {"symbols": "SPY,QQQ", "timeframe": "1Min", "start": "2026-08-28T17:00:00Z", "end": "2026-08-28T20:00:00Z", "feed": "sip"},
+      "params": {
+        "symbols": "SPY,QQQ",
+        "timeframe": "1Min",
+        "start": "2026-08-28T17:00:00Z",
+        "end": "2026-08-28T20:00:00Z",
+        "feed": "sip"
+      },
       "rows": 180
     },
     {
       "path": "option_snapshots_2026-08-28.csv",
       "source_tool": "get_option_chain",
       "params": [
-        {"underlying_symbol": "SPY", "type": "call", "expiration_date_gte": "2026-09-02", "expiration_date_lte": "2026-09-04", "strike_price_gte": 762, "strike_price_lte": 788},
-        {"underlying_symbol": "SPY", "type": "put", "expiration_date": "2026-09-04", "strike_price_gte": 756, "strike_price_lte": 774},
-        {"underlying_symbol": "QQQ", "type": "call", "expiration_date": "2026-09-03", "strike_price_gte": 710, "strike_price_lte": 730}
+        {
+          "underlying_symbol": "SPY",
+          "type": "call",
+          "expiration_date_gte": "2026-09-02",
+          "expiration_date_lte": "2026-09-04",
+          "strike_price_gte": 762,
+          "strike_price_lte": 788
+        },
+        {
+          "underlying_symbol": "SPY",
+          "type": "put",
+          "expiration_date": "2026-09-04",
+          "strike_price_gte": 756,
+          "strike_price_lte": 774
+        },
+        {
+          "underlying_symbol": "QQQ",
+          "type": "call",
+          "expiration_date": "2026-09-03",
+          "strike_price_gte": 710,
+          "strike_price_lte": 730
+        },
+        {
+          "underlying_symbol": "QQQ",
+          "type": "put",
+          "expiration_date": "2026-09-03",
+          "strike_price_gte": 704,
+          "strike_price_lte": 722
+        }
       ],
-      "rows": 67,
-      "note": "Greeks and implied volatility are as returned by Alpaca's OPRA option chain snapshot. quote_ts truncated to whole seconds; all captured quotes carried the same 2026-08-28T19:59:59Z second."
+      "rows": 86,
+      "note": "Greeks and implied volatility are as returned by Alpaca's OPRA option chain snapshot. quote_ts truncated to whole seconds; all captured quotes carried the same 2026-08-28T19:59:59Z second. QQQ puts were captured in a second pass on 2026-08-29 after preflight correctly reported the gap; same session snapshot (quote timestamps 2026-08-28T19:59:59Z)."
     }
   ],
   "integrity_note": "Every value in these files was returned by the Alpaca MCP server on the capture date. Nothing is synthetic. These fixtures exist because this build container's network policy blocks paper-api.alpaca.markets and data.alpaca.markets (HTTP 403 at CONNECT), so the Python runtime cannot call Alpaca REST directly from here."
