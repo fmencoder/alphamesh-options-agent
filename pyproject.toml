@@ -44,6 +44,13 @@ ignore = ["B008"]
 [tool.mypy]
 python_version = "3.12"
 packages = ["alphamesh"]
+# `mypy` and `mypy .` must mean the same thing: strict checking of the
+# production package. Tests were never in the type gate (they use untyped
+# pytest fixtures and rely on runtime asserts mypy cannot follow), so they are
+# excluded from discovery rather than silently failing only one invocation.
+explicit_package_bases = true
+mypy_path = "."
+exclude = ["^tests/", "^dashboard/", "^scripts/", "^\\.venv/"]
 ignore_missing_imports = true
 warn_unused_ignores = false
 disallow_untyped_defs = true

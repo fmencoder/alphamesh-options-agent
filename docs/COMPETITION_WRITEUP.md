@@ -159,7 +159,7 @@ QQQ BULL_CALL_SPREAD   LONG QQQ260903C00715000 (δ 0.5552)
 |---|---|
 | **Any order placed** | **No. Zero orders have been submitted to Alpaca.** |
 | **P&L** | **None. No trade has been opened or closed, so there is no P&L to report.** |
-| Alpaca REST from the Python runtime | Not exercised over the network. The build container's network policy returns HTTP 403 at CONNECT for `paper-api.alpaca.markets` and `data.alpaca.markets`. Request construction and the alpaca-py→domain mapping are unit-tested against stubbed clients (`tests/test_rest_adapters.py`); the sockets themselves are not. |
+| Alpaca REST from the Python runtime | **Not exercised over the network.** The build container's network policy returns HTTP 403 at CONNECT for `paper-api.alpaca.markets` and `data.alpaca.markets`, and no Alpaca credentials are present in it. Request construction, the alpaca-py→domain mapping and the multi-leg order payload are unit-tested against stubbed clients and audited line-by-line against Alpaca's published OpenAPI contract (`tests/test_rest_adapters.py`, `tests/test_alpaca_contract.py`); the sockets themselves are not. |
 | Alpaca CLI execution | No CLI binary is installed in this environment. The adapter reports unavailable rather than simulating output. |
 | Live-market behaviour | The captured session is a quiet Friday afternoon. The agent correctly declined to trade it. |
 | Railway deployment | `Dockerfile`, `railway.json` and `Procfile` are written and `alphamesh health` works locally, exiting non-zero when the paper guard fails. The image has **not** been built: no Docker daemon is available in this environment. No deploy has been performed. |
@@ -185,9 +185,38 @@ The full entry→fill→manage→exit lifecycle is exercised end to end in
 duplicate protection, restart recovery, ambiguous-submission handling,
 circuit-breaker exits and correlated-exposure gating.
 
+### Runtime readiness pass (2026-08-29)
+
+A Railway runtime audit found and fixed five real defects. Each has a
+regression test; none required weakening a safety gate.
+
+| # | Defect | Severity | Fix |
+|---|---|---|---|
+| 1 | Silent fallback to simulated execution. `ALPHAMESH_DRY_RUN` defaults true, so a deploy that forgot to set it false would write fabricated fills into the journal a judge reads for P&L, announced only by an INFO log. | High | Refuse to start when `dry_run=false` without credentials; `WARNING` on every simulated start; `execution_mode` recorded on every opened position and surfaced by preflight. |
+| 2 | No market-hours gate. The cycle scanned, scored, invoked the AI council and pulled option chains with the market closed, with only the stale-quote gate between it and a trade on dead data. No backoff either. | High | Clock consulted first; a closed market does zero work and backs off, never sleeping past the next open. An unreadable clock is treated as closed. |
+| 3 | Preflight was not authoritative: it exited 0 even when the account was unreachable or a chain was empty, and emitted no machine-readable result. | High | Rewritten with `PREFLIGHT_*` flags and non-zero exit on any execution-critical failure. It immediately caught a real gap: QQQ puts had never been captured. |
+| 4 | Paper mode was proven at startup and at cycle start, but not at the wire. | Medium | Explicit revalidation immediately before submission; failure rejects with `LIVE_TRADING_FORBIDDEN` and journals `live_trading_blocked`. |
+| 5 | Railway volume: `DATABASE_PATH` pointed inside the image layer, and a root-owned volume would have broken the non-root container obscurely mid-cycle. | Medium | `/data` volume path documented; `docker-entrypoint.sh` fails fast (exit 78) with the exact remedy. |
+
+Closed-market soak, real runtime: 36s produced 4 cycles at the configured
+backoff (not the open-market interval, not a busy loop), zero decisions, zero
+orders, SIGTERM honoured in 0.3s, journal additive across restart.
+
+### Competition account freshness (verified via MCP)
+
+| Check | Result |
+|---|---|
+| Orders, all statuses | **empty** - zero orders ever placed |
+| Open positions | **empty** |
+| Account activities | exactly one: a `JNLC` cash journal of **$100,000** on 2026-07-18 |
+| Fills (`FILL` activities) | **none** |
+| Equity / last equity | $100,000.00 / $100,000.00 |
+
+The account is provably fresh, never traded and funded at exactly $100,000.
+
 ### Quality gates
 
-- **350 tests pass.** No network access, no LLM key, no Alpaca credentials
+- **416 tests pass.** No network access, no LLM key, no Alpaca credentials
   required.
 - **`ruff check` clean.**
 - **`mypy` clean** across 49 source files with `disallow_untyped_defs`.

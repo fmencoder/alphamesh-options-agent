@@ -281,6 +281,18 @@ output**.
 - **Restart recovery.** Every non-terminal order is re-read from the broker
   before any new order can be built.
 
+## Market-hours behaviour
+
+The cycle consults the trading calendar before doing anything else. With the
+market closed it does **no** work: no market-data pull, no AI council call, no
+option chain fetch — and backs off to `ALPHAMESH_CLOSED_POLL_SECONDS`, never
+sleeping past the next open. A clock it cannot read is treated as **closed**,
+never as open.
+
+Soak-tested: 36 seconds with the market closed produced 4 cycles at the 300s-
+equivalent backoff, zero decisions, zero orders, and a clean SIGTERM shutdown in
+0.3s.
+
 ## Dashboard
 
 ```bash
@@ -321,13 +333,30 @@ cp .env.example .env      # then add your Alpaca PAPER keys
 ```
 
 ```bash
-alphamesh preflight       # safety + connectivity report, places no orders
+alphamesh preflight       # authoritative readiness report; places ZERO orders
 alphamesh once            # one full lifecycle cycle
 alphamesh run             # the autonomous loop
 alphamesh report          # competition analytics
 alphamesh health          # JSON health record for a probe
 alphamesh mcp-info        # exactly which MCP tools are used
 alphamesh cli-info        # whether the Alpaca CLI path is available
+```
+
+`preflight` is safe to run against the real competition account: it wraps the
+broker in a read-only proxy whose write methods raise, so "places no orders" is
+structural rather than a promise. It exits non-zero when an execution-critical
+dependency fails, and ends with a machine-readable block:
+
+```
+PREFLIGHT_PAPER_MODE=PASS
+PREFLIGHT_ACCOUNT=PASS
+PREFLIGHT_MARKET_DATA=PASS
+PREFLIGHT_OPTIONS_CHAIN=PASS
+PREFLIGHT_GREEKS=PASS
+PREFLIGHT_JOURNAL=PASS
+PREFLIGHT_RECOVERY=PASS
+PREFLIGHT_AI_PROVIDER=PASS
+PREFLIGHT_READY=YES
 ```
 
 Offline, against the committed real-Alpaca capture:
@@ -344,7 +373,7 @@ on every run.
 Checks:
 
 ```bash
-pytest        # 350 tests, no network, no LLM key
+pytest        # 416 tests, no network, no LLM key
 ruff check .
 mypy
 ```
@@ -359,13 +388,42 @@ dashboard  streamlit run dashboard/app.py --server.port $PORT --server.address 0
 ```
 
 `Dockerfile`, `railway.json` and `Procfile` are included (the image has not yet
-been built — see the validation record). Mount a volume at
-`/app/data` so the journal survives redeploys. Set `ALPACA_PAPER`,
-`APCA_API_KEY_ID`, `APCA_API_SECRET_KEY`, `ANTHROPIC_API_KEY` and
-`ALPHAMESH_DRY_RUN=false` as Railway variables. **No secret is baked into the
-image.** The container health check runs `alphamesh health`, which exits
-non-zero when the paper guard does not pass — an unsafe container never reports
-healthy.
+been built — see the validation record).
+
+**Required volume:**
+
+```
+RAILWAY_VOLUME_PATH=/data
+DATABASE_PATH=/data/alphamesh.db
+```
+
+The journal is the source of truth for restart recovery, so it must outlive the
+container. A Railway volume is mounted root-owned by default while this image
+runs as uid 10001; `docker-entrypoint.sh` checks writability at startup and
+exits 78 with the exact fix rather than failing obscurely mid-cycle.
+
+**Required variables** (no secret is baked into the image):
+
+| Variable | Value | Notes |
+|---|---|---|
+| `ALPACA_PAPER` | `true` | Startup is blocked otherwise |
+| `APCA_API_KEY_ID` | paper key | |
+| `APCA_API_SECRET_KEY` | paper secret | |
+| `ANTHROPIC_API_KEY` | optional | Absent → deterministic heuristic council |
+| `DATABASE_PATH` | `/data/alphamesh.db` | Must be on the volume |
+| `ALPHAMESH_DRY_RUN` | `false` | **Critical** — see below |
+| `ALPHAMESH_LOOP_SECONDS` | `60` | Cycle interval while open |
+| `ALPHAMESH_CLOSED_POLL_SECONDS` | `300` | Backoff while closed |
+
+**`ALPHAMESH_DRY_RUN` defaults to `true`.** Left unset, the agent runs the
+in-process simulator: no order reaches Alpaca and any P&L in the journal is
+fabricated. That is announced with a `WARNING` on every start, recorded as
+`execution_mode` on every opened position and reported by `alphamesh preflight`.
+Setting it `false` without credentials makes the agent **refuse to start**
+rather than silently simulate.
+
+The container health check runs `alphamesh health`, which exits non-zero when
+the paper guard does not pass — an unsafe container never reports healthy.
 
 The runtime is a plain Python process. It does not depend on Claude Code, an
 MCP host, or any interactive session remaining open.
