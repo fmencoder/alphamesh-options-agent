@@ -22,16 +22,45 @@ from typing import Protocol, runtime_checkable
 from alphamesh.alpaca.types import MarketClock
 from alphamesh.models.domain import Bar, MarketSnapshot
 
+LOOKBACK_CALENDAR_DAYS = 7
+"""Calendar days of history requested to build a bar window.
+
+Deliberately calendar-based, not minute-based. A ``now - N minutes`` window
+contains zero market minutes over a weekend, and at the opening bell it falls
+short of the previous session, so the agent would starve for the first hour of
+every day. Seven days clears a three-day holiday weekend with room to spare.
+"""
+
 
 @runtime_checkable
 class MarketDataProvider(Protocol):
     def snapshot(self, symbol: str, lookback_minutes: int = 180) -> MarketSnapshot: ...
 
+    def latest_bar(self, symbol: str) -> Bar: ...
+
     def clock(self) -> MarketClock: ...
+
+
+BAR_REQUEST_LIMIT = 10_000
+"""Upper bound on bars per request. Requests are per-symbol, so a shared limit
+can never satisfy one symbol while starving the other."""
 
 
 class MarketDataUnavailableError(RuntimeError):
     """The provider could not supply usable data for a symbol."""
+
+
+def _to_bar(raw: object) -> Bar:
+    """Map an alpaca-py bar onto the domain model."""
+    return Bar(
+        timestamp=raw.timestamp,  # type: ignore[attr-defined]
+        open=float(raw.open),  # type: ignore[attr-defined]
+        high=float(raw.high),  # type: ignore[attr-defined]
+        low=float(raw.low),  # type: ignore[attr-defined]
+        close=float(raw.close),  # type: ignore[attr-defined]
+        volume=float(raw.volume),  # type: ignore[attr-defined]
+        vwap=float(raw.vwap) if getattr(raw, "vwap", None) is not None else None,  # type: ignore[attr-defined]
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -113,6 +142,12 @@ class CaptureMarketData:
             bars=tuple(window),
         )
 
+    def latest_bar(self, symbol: str) -> Bar:
+        bars = self._load(symbol)
+        if not bars:
+            raise MarketDataUnavailableError(f"captured bar file for {symbol} is empty")
+        return bars[-1]
+
     def clock(self) -> MarketClock:
         return MarketClock(timestamp=datetime.now(UTC), is_open=self.market_open)
 
@@ -140,6 +175,27 @@ class AlpacaRestMarketData:
             self._client = StockHistoricalDataClient(self._api_key, self._api_secret)
         return self._client
 
+    def latest_bar(self, symbol: str) -> Bar:
+        """Most recent 1-minute bar Alpaca holds for the symbol.
+
+        Unlike a historical range request this returns the last completed
+        session's final bar when the market is shut, so it proves live REST
+        market-data access on a weekend or holiday.
+        """
+        from alpaca.data.enums import DataFeed
+        from alpaca.data.requests import StockLatestBarRequest
+
+        request = StockLatestBarRequest(
+            symbol_or_symbols=symbol, feed=DataFeed(self.feed)
+        )
+        response = self._stock_client().get_stock_latest_bar(request)
+        raw = response.get(symbol) if hasattr(response, "get") else None
+        if raw is None:
+            raise MarketDataUnavailableError(
+                f"Alpaca returned no latest bar for {symbol} on feed {self.feed}"
+            )
+        return _to_bar(raw)
+
     def snapshot(self, symbol: str, lookback_minutes: int = 180) -> MarketSnapshot:
         from datetime import timedelta
 
@@ -147,32 +203,29 @@ class AlpacaRestMarketData:
         from alpaca.data.requests import StockBarsRequest
         from alpaca.data.timeframe import TimeFrame
 
+        # Calendar-day window, not `now - N minutes`. See LOOKBACK_CALENDAR_DAYS.
+        # The window is deliberately wide and then trimmed to the most recent
+        # `lookback_minutes` bars, so behaviour mid-session is unchanged while a
+        # weekend, holiday or opening bell no longer yields an empty result.
         end = datetime.now(UTC)
-        start = end - timedelta(minutes=lookback_minutes * 3)
+        start = end - timedelta(days=LOOKBACK_CALENDAR_DAYS)
         request = StockBarsRequest(
             symbol_or_symbols=symbol,
             timeframe=TimeFrame.Minute,
             start=start,
             end=end,
             feed=DataFeed(self.feed),
+            limit=BAR_REQUEST_LIMIT,
         )
         response = self._stock_client().get_stock_bars(request)
         raw = response.data.get(symbol, []) if hasattr(response, "data") else []
-        bars = [
-            Bar(
-                timestamp=b.timestamp,
-                open=float(b.open),
-                high=float(b.high),
-                low=float(b.low),
-                close=float(b.close),
-                volume=float(b.volume),
-                vwap=float(b.vwap) if getattr(b, "vwap", None) is not None else None,
-            )
-            for b in raw
-        ]
+        bars = [_to_bar(b) for b in raw]
         bars = bars[-lookback_minutes:]
         if not bars:
-            raise MarketDataUnavailableError(f"Alpaca returned no bars for {symbol}")
+            raise MarketDataUnavailableError(
+                f"Alpaca returned no bars for {symbol} over the last "
+                f"{LOOKBACK_CALENDAR_DAYS} calendar days on feed {self.feed}"
+            )
         last = bars[-1]
         return MarketSnapshot(
             symbol=symbol,
@@ -200,6 +253,8 @@ class AlpacaRestMarketData:
 
 
 __all__ = [
+    "BAR_REQUEST_LIMIT",
+    "LOOKBACK_CALENDAR_DAYS",
     "AlpacaRestMarketData",
     "CaptureMarketData",
     "MarketDataProvider",

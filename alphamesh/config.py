@@ -59,6 +59,7 @@ class Settings(BaseModel):
     data_source: str = "rest"
     capture_dir: Path = PROJECT_ROOT / "data" / "mcp_capture"
     capture_market_open: bool = True
+    equities_feed: str = "iex"
     alpaca_cli_path: str = "alpaca"
 
     @property
@@ -80,6 +81,7 @@ class Settings(BaseModel):
             "data_url": self.data_url,
             "database_path": str(self.database_path),
             "data_source": self.data_source,
+            "equities_feed": self.equities_feed,
             "dry_run": self.dry_run,
             "loop_seconds": self.loop_seconds,
             "closed_poll_seconds": self.closed_poll_seconds,
@@ -106,6 +108,9 @@ def load_settings() -> Settings:
         data_source=(_env("ALPHAMESH_DATA_SOURCE") or "rest").lower(),
         capture_dir=Path(cap),
         capture_market_open=_env_bool("ALPHAMESH_CAPTURE_MARKET_OPEN", True),
+        # Default to the free IEX feed. SIP is a paid entitlement; hard-coding it
+        # would turn a working deployment into a 403.
+        equities_feed=(_env("ALPHAMESH_EQUITIES_FEED") or "iex").lower(),
         alpaca_cli_path=_env("ALPACA_CLI_PATH") or "alpaca",
     )
 

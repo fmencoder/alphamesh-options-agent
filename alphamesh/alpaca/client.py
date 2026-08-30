@@ -73,7 +73,9 @@ def build_stack(settings: Settings) -> AlpacaStack:
         )
         option_chain: OptionChainProvider = CaptureOptionChain(settings.capture_dir)
     elif settings.has_credentials:
-        market_data = AlpacaRestMarketData(settings.api_key_id, settings.api_secret_key)
+        market_data = AlpacaRestMarketData(
+            settings.api_key_id, settings.api_secret_key, feed=settings.equities_feed
+        )
         option_chain = AlpacaRestOptionChain(settings.api_key_id, settings.api_secret_key)
     else:
         raise RuntimeError(

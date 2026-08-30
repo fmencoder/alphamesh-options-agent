@@ -30,7 +30,7 @@ from typing import Any
 from alphamesh import __version__
 from alphamesh.alpaca.cli_adapter import AlpacaCliAdapter
 from alphamesh.alpaca.client import build_stack
-from alphamesh.alpaca.market_data import CaptureMarketData
+from alphamesh.alpaca.market_data import LOOKBACK_CALENDAR_DAYS, CaptureMarketData
 from alphamesh.alpaca.mcp_adapter import describe_mcp_usage
 from alphamesh.analytics import build_report
 from alphamesh.config import AppConfig, load_config
@@ -241,26 +241,60 @@ def cmd_preflight(config: AppConfig) -> int:
         detail["clock"] = {"reachable": False, "error": str(exc)}
 
     # --------------------------------------------------------- market data
+    # Two independent probes per symbol, because a closed market must not look
+    # like a broken feed:
+    #   latest_bar  - proves live REST market-data access even on a weekend or
+    #                 holiday, since it returns the last completed session's bar
+    #   snapshot    - proves enough real historical depth for the feature engine
+    # MARKET_CLOSED is reported, never treated as a failure. Only genuinely
+    # absent or unreadable data fails the gate.
     market: dict[str, Any] = {}
     market_ok = True
     for symbol in config.universe.symbols:
+        entry: dict[str, Any] = {"feed": getattr(stack.market_data, "feed", "n/a")}
+        latest_ok = False
+        depth_ok = False
+
+        try:
+            latest = stack.market_data.latest_bar(symbol)
+            entry["latest_bar_timestamp"] = latest.timestamp.isoformat()
+            entry["latest_bar_close"] = latest.close
+            entry["latest_bar_source"] = "alpaca_latest_bar"
+            latest_ok = True
+        except Exception as exc:
+            entry["latest_bar_error"] = _describe_data_error(exc)
+
         try:
             snapshot = stack.market_data.snapshot(
                 symbol, lookback_minutes=config.universe.bar_lookback_minutes
             )
-            enough = snapshot.bar_count >= config.universe.min_bars_required
-            market[symbol] = {
-                "bars": snapshot.bar_count,
-                "min_required": config.universe.min_bars_required,
-                "sufficient": enough,
-                "last_price": snapshot.last_price,
-                "as_of": snapshot.as_of.isoformat(),
-            }
-            market_ok = market_ok and enough
+            depth_ok = snapshot.bar_count >= config.universe.min_bars_required
+            entry.update(
+                {
+                    "bars": snapshot.bar_count,
+                    "min_required": config.universe.min_bars_required,
+                    "sufficient": depth_ok,
+                    "last_price": snapshot.last_price,
+                    "as_of": snapshot.as_of.isoformat(),
+                    "lookback_calendar_days": LOOKBACK_CALENDAR_DAYS,
+                }
+            )
         except Exception as exc:
-            market[symbol] = {"error": str(exc)}
-            market_ok = False
+            entry["historical_error"] = _describe_data_error(exc)
+
+        entry["status"] = (
+            "OK" if latest_ok and depth_ok else "MARKET_DATA_UNAVAILABLE"
+        )
+        market[symbol] = entry
+        market_ok = market_ok and latest_ok and depth_ok
+
     detail["market_data"] = market
+    detail["equities_feed"] = config.settings.equities_feed
+    detail["market_data_note"] = (
+        "A closed market is not a failure: latest_bar returns the last completed "
+        "session, so this gate distinguishes MARKET_CLOSED from "
+        "MARKET_DATA_UNAVAILABLE."
+    )
     flags["PREFLIGHT_MARKET_DATA"] = "PASS" if market_ok and market else "FAIL"
 
     # -------------------------------------------------------- option chain
@@ -350,6 +384,23 @@ def cmd_preflight(config: AppConfig) -> int:
     detail["failed_critical_checks"] = failed
     flags["PREFLIGHT_READY"] = "YES" if not failed else "NO"
     return _emit_preflight(detail, flags, exit_code=0 if not failed else 1)
+
+
+def _describe_data_error(exc: Exception) -> str:
+    """Classify a market-data failure precisely instead of reporting a bare string.
+
+    Entitlement and auth problems must never be reported as "no data" - they
+    need a different fix from an empty window.
+    """
+    text = str(exc)
+    lowered = text.lower()
+    if "401" in text or "unauthorized" in lowered:
+        return f"AUTH_FAILED (401): {text[:300]}"
+    if "403" in text or "forbidden" in lowered or "subscription" in lowered:
+        return f"FEED_NOT_ENTITLED (403): {text[:300]}"
+    if "no bars" in lowered or "no latest bar" in lowered or "empty" in lowered:
+        return f"NO_DATA_RETURNED: {text[:300]}"
+    return f"{type(exc).__name__}: {text[:300]}"
 
 
 def _emit_preflight(detail: dict[str, Any], flags: dict[str, str], exit_code: int) -> int:
