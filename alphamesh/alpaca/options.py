@@ -130,7 +130,14 @@ class AlpacaRestOptionChain:
         if self._client is None:
             from alpaca.data.historical.option import OptionHistoricalDataClient
 
-            self._client = OptionHistoricalDataClient(self._api_key, self._api_secret)
+            # raw_data=True is required, not a preference. alpaca-py's
+            # OptionsSnapshot model declares only symbol, latest_trade,
+            # latest_quote, implied_volatility and greeks -- it silently drops
+            # the dailyBar the API actually returns. Parsing the model would
+            # make day_volume permanently 0 and fail every liquidity gate.
+            self._client = OptionHistoricalDataClient(
+                self._api_key, self._api_secret, raw_data=True
+            )
         return self._client
 
     def chain(
@@ -163,34 +170,52 @@ class AlpacaRestOptionChain:
     def _to_candidate(
         symbol: str, underlying: str, snap: Any
     ) -> OptionContractCandidate | None:
+        """Map one raw Alpaca options snapshot to a domain candidate.
+
+        ``snap`` is the verbatim JSON object for the contract, so the keys are
+        the wire names (camelCase), not alpaca-py model attributes.
+        """
         parsed = parse_occ_symbol(symbol)
         if parsed is None:
             return None
         expiration, opt_type, strike = parsed
+        if not isinstance(snap, dict):
+            return None
 
         quote: OptionQuote | None = None
-        raw_quote = getattr(snap, "latest_quote", None)
-        if raw_quote is not None:
-            bid = float(getattr(raw_quote, "bid_price", 0) or 0)
-            ask = float(getattr(raw_quote, "ask_price", 0) or 0)
+        raw_quote = snap.get("latestQuote")
+        if isinstance(raw_quote, dict):
+            bid = float(raw_quote.get("bp") or 0)
+            ask = float(raw_quote.get("ap") or 0)
             if ask >= bid:
+                raw_ts = raw_quote.get("t")
                 quote = OptionQuote(
                     bid=bid,
                     ask=ask,
-                    bid_size=int(getattr(raw_quote, "bid_size", 0) or 0),
-                    ask_size=int(getattr(raw_quote, "ask_size", 0) or 0),
-                    quote_timestamp=getattr(raw_quote, "timestamp", datetime.now(UTC)),
+                    bid_size=int(float(raw_quote.get("bs") or 0)),
+                    ask_size=int(float(raw_quote.get("as") or 0)),
+                    quote_timestamp=(
+                        _parse_ts(raw_ts)
+                        if isinstance(raw_ts, str)
+                        else datetime.now(UTC)
+                    ),
                 )
 
-        raw_greeks = getattr(snap, "greeks", None)
+        raw_greeks = snap.get("greeks")
+        raw_greeks = raw_greeks if isinstance(raw_greeks, dict) else {}
         greeks = Greeks(
-            delta=_opt_float(getattr(raw_greeks, "delta", None)),
-            gamma=_opt_float(getattr(raw_greeks, "gamma", None)),
-            theta=_opt_float(getattr(raw_greeks, "theta", None)),
-            vega=_opt_float(getattr(raw_greeks, "vega", None)),
-            implied_volatility=_opt_float(getattr(snap, "implied_volatility", None)),
+            delta=_opt_float(raw_greeks.get("delta")),
+            gamma=_opt_float(raw_greeks.get("gamma")),
+            theta=_opt_float(raw_greeks.get("theta")),
+            vega=_opt_float(raw_greeks.get("vega")),
+            implied_volatility=_opt_float(snap.get("impliedVolatility")),
         )
-        daily = getattr(snap, "daily_bar", None)
+
+        daily = snap.get("dailyBar")
+        day_volume = 0
+        if isinstance(daily, dict):
+            day_volume = int(float(daily.get("v") or 0))
+
         return OptionContractCandidate(
             symbol=symbol,
             underlying=underlying,
@@ -199,7 +224,7 @@ class AlpacaRestOptionChain:
             strike=strike,
             quote=quote,
             greeks=greeks,
-            day_volume=int(float(getattr(daily, "volume", 0) or 0)),
+            day_volume=day_volume,
         )
 
 

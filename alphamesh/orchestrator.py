@@ -366,12 +366,20 @@ class Orchestrator:
         )
 
         if selection.spread is None:
-            self._record_rejection(
-                decision,
-                selection.reason_codes or (ReasonCode.NO_ELIGIBLE_CONTRACTS,),
+            codes = selection.reason_codes or (ReasonCode.NO_ELIGIBLE_CONTRACTS,)
+            # Governor rejections already log their codes; selection rejections
+            # did not, which made a 100% selection failure invisible in
+            # production and diagnosable only from the SQLite journal.
+            log.info(
+                "contract_selection_rejected symbol=%s strategy=%s chain_size=%d "
+                "reason_codes=%s detail=%s",
+                decision.symbol,
+                decision.strategy.value,
+                len(chain),
+                [c.value for c in codes],
                 selection.detail,
-                report,
             )
+            self._record_rejection(decision, codes, selection.detail, report)
             return
 
         spread = selection.spread
