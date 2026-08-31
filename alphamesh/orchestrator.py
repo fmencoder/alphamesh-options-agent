@@ -34,7 +34,7 @@ from alphamesh.execution.monitor import (
 )
 from alphamesh.execution.order_builder import build_order_intent
 from alphamesh.execution.recovery import reconcile_open_orders
-from alphamesh.execution.state_machine import transition
+from alphamesh.execution.state_machine import is_terminal, transition
 from alphamesh.intelligence.reasoning import ReasoningProvider
 from alphamesh.models.domain import (
     OPTION_MULTIPLIER,
@@ -64,6 +64,18 @@ from alphamesh.strategies.bull_call import build_bull_call_spread
 log = logging.getLogger(__name__)
 
 
+
+def _parse_journal_ts(raw: object) -> datetime | None:
+    """Parse a journal timestamp, normalising naive values to UTC."""
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
 @dataclass
 class CycleReport:
     """Everything that happened in one pass, for logs and the dashboard."""
@@ -84,6 +96,7 @@ class CycleReport:
     quant_passes: int = 0
     ai_tradable: int = 0
     entry_fills: int = 0
+    stale_orders_cancelled: int = 0
     contracts_selected: int = 0
     risk_approved: int = 0
     open_positions: int = 0
@@ -116,6 +129,7 @@ class CycleReport:
             "quant_passes": self.quant_passes,
             "ai_tradable": self.ai_tradable,
             "entry_fills": self.entry_fills,
+            "stale_orders_cancelled": self.stale_orders_cancelled,
             "contracts_selected": self.contracts_selected,
             "risk_approved": self.risk_approved,
             "open_positions": self.open_positions,
@@ -274,10 +288,22 @@ class Orchestrator:
         if breaker.tripped:
             self.journal.record_event("circuit_breaker", {"detail": breaker.detail})
 
-        # 1. Manage what is already open, before considering anything new.
+        # 1. Retire entry orders the market has walked away from, before
+        #    anything else reads portfolio state -- a stale working order holds
+        #    the per-symbol duplicate lock.
+        self._expire_stale_entry_orders(now, report)
+        if report.stale_orders_cancelled:
+            try:
+                portfolio = self.portfolio_state(now)
+            except Exception as exc:  # pragma: no cover - defensive
+                log.exception("could not re-read portfolio after stale sweep")
+                report.errors.append(f"portfolio_state: {exc}")
+                return report
+
+        # 2. Manage what is already open, before considering anything new.
         self._manage_positions(portfolio, now, breaker.tripped, report)
 
-        # 2. Scan and decide.
+        # 3. Scan and decide.
         scanned = self.scout.scan()
         report.symbols_scanned = len(scanned)
 
@@ -329,6 +355,125 @@ class Orchestrator:
 
         self.journal.record_event("cycle_complete", report.as_dict())
         return report
+
+    # -------------------------------------------------------- stale orders
+    def _expire_stale_entry_orders(self, now: datetime, report: CycleReport) -> None:
+        """Abandon zero-fill entry orders older than the configured TTL.
+
+        A working order holds the per-symbol duplicate lock. A limit the market
+        has walked away from therefore blocks that symbol for the rest of the
+        session while never filling. Retiring it frees the symbol; it does NOT
+        place anything. Any replacement must earn its way back through a fresh
+        quant -> AI -> contract -> risk cycle, at prices current at that time.
+
+        A partially filled order is never touched here: it is real exposure and
+        belongs to the position and exit paths, not to a timeout.
+        """
+        ttl = self.config.settings.entry_order_ttl_seconds
+        if ttl <= 0:
+            return
+
+        for row in self.journal.open_orders():
+            try:
+                state = TradeState(str(row["state"]))
+            except ValueError:
+                continue
+            # Only orders that are on the wire and not yet filled at all.
+            if state is not TradeState.SUBMITTED:
+                continue
+
+            client_order_id = str(row["client_order_id"])
+            symbol = str(row.get("symbol") or "")
+            created = _parse_journal_ts(row.get("created_at"))
+            if created is None:
+                continue
+            age = (now - created).total_seconds()
+            if age < ttl:
+                continue
+
+            # Re-read the broker before acting. The journal can be behind, and
+            # cancelling something that has just filled would be far worse than
+            # leaving a stale order in place.
+            try:
+                record = self.monitor.refresh(client_order_id)
+            except Exception as exc:
+                log.warning("stale sweep could not refresh %s: %s", client_order_id, exc)
+                continue
+            if record is None:
+                continue
+            if record.filled_quantity > 0:
+                log.info(
+                    "stale_order_skipped client_order_id=%s symbol=%s age_s=%.0f "
+                    "reason=PARTIAL_OR_FULL_FILL filled_qty=%d",
+                    client_order_id,
+                    symbol,
+                    age,
+                    record.filled_quantity,
+                )
+                continue
+            if record.broker_order_id is None:
+                continue
+
+            try:
+                self.stack.broker.cancel_order(record.broker_order_id)
+            except BrokerError as exc:
+                log.warning(
+                    "stale_order_cancel_failed client_order_id=%s symbol=%s "
+                    "age_s=%.0f error=%s",
+                    client_order_id,
+                    symbol,
+                    age,
+                    exc,
+                )
+                continue
+
+            # Confirm with the broker before treating the lock as released.
+            # Marking it terminal on an unconfirmed cancel would free the symbol
+            # while the order is still live and could still fill.
+            confirmed = self.monitor.refresh(client_order_id)
+            after = self.journal.get_order(client_order_id)
+            released = after is not None and is_terminal(TradeState(str(after["state"])))
+            # "Not filled" is not confirmation: an order the broker still shows
+            # as live could fill a moment later. Only a broker-reported dead
+            # status -- which the monitor persists as a terminal state -- proves
+            # the cancel landed and makes it safe to free the symbol.
+            if confirmed is None or confirmed.filled_quantity > 0 or not released:
+                log.warning(
+                    "stale_order_cancel_unconfirmed client_order_id=%s symbol=%s "
+                    "age_s=%.0f status=%s filled_qty=%s",
+                    client_order_id,
+                    symbol,
+                    age,
+                    confirmed.status if confirmed else "unknown",
+                    confirmed.filled_quantity if confirmed else "unknown",
+                )
+                continue
+
+            report.stale_orders_cancelled += 1
+            log.info(
+                "stale_order_cancelled client_order_id=%s symbol=%s age_s=%.0f "
+                "ttl_s=%d limit_price_cents=%s broker_status=%s filled_qty=%d "
+                "duplicate_lock_released=%s",
+                client_order_id,
+                symbol,
+                age,
+                ttl,
+                row.get("limit_price_cents"),
+                confirmed.status,
+                confirmed.filled_quantity,
+                released,
+            )
+            self.journal.record_event(
+                "stale_entry_order_cancelled",
+                {
+                    "client_order_id": client_order_id,
+                    "age_seconds": round(age, 1),
+                    "ttl_seconds": ttl,
+                    "broker_status": confirmed.status,
+                    "duplicate_lock_released": released,
+                },
+                symbol=symbol or None,
+            )
 
     # ---------------------------------------------------------------- entry
     def _attempt_entry(

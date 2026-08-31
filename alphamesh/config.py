@@ -54,6 +54,10 @@ class Settings(BaseModel):
     database_path: Path = PROJECT_ROOT / "data" / "alphamesh.db"
     loop_seconds: int = 30
     closed_poll_seconds: int = 300
+    # Age at which a zero-fill entry order is abandoned. A working order holds
+    # the per-symbol duplicate lock, so a limit that the market has walked away
+    # from silently blocks that symbol for the rest of the session.
+    entry_order_ttl_seconds: int = 180
     dry_run: bool = True
     log_level: str = "INFO"
     data_source: str = "rest"
@@ -85,6 +89,7 @@ class Settings(BaseModel):
             "dry_run": self.dry_run,
             "loop_seconds": self.loop_seconds,
             "closed_poll_seconds": self.closed_poll_seconds,
+            "entry_order_ttl_seconds": self.entry_order_ttl_seconds,
         }
 
 
@@ -103,6 +108,7 @@ def load_settings() -> Settings:
         database_path=Path(db),
         loop_seconds=_env_int("ALPHAMESH_LOOP_SECONDS", 30),
         closed_poll_seconds=_env_int("ALPHAMESH_CLOSED_POLL_SECONDS", 300),
+        entry_order_ttl_seconds=_env_int("ALPHAMESH_ENTRY_ORDER_TTL_SECONDS", 180),
         dry_run=_env_bool("ALPHAMESH_DRY_RUN", True),
         log_level=_env("ALPHAMESH_LOG_LEVEL") or "INFO",
         data_source=(_env("ALPHAMESH_DATA_SOURCE") or "rest").lower(),
