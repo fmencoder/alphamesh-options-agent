@@ -79,6 +79,15 @@ class CycleReport:
     rejections: list[tuple[str, tuple[ReasonCode, ...]]] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     circuit_breaker_tripped: bool = False
+    # Funnel counters. Each stage increments exactly once per candidate, so the
+    # sequence reads as a strict narrowing from scan to fill.
+    quant_passes: int = 0
+    ai_tradable: int = 0
+    contracts_selected: int = 0
+    risk_approved: int = 0
+    open_positions: int = 0
+    realized_pnl_cents: int = 0
+    unrealized_pnl_cents: int = 0
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -103,6 +112,13 @@ class CycleReport:
             "rejections": [(s, [c.value for c in codes]) for s, codes in self.rejections],
             "errors": list(self.errors),
             "circuit_breaker_tripped": self.circuit_breaker_tripped,
+            "quant_passes": self.quant_passes,
+            "ai_tradable": self.ai_tradable,
+            "contracts_selected": self.contracts_selected,
+            "risk_approved": self.risk_approved,
+            "open_positions": self.open_positions,
+            "realized_pnl_cents": self.realized_pnl_cents,
+            "unrealized_pnl_cents": self.unrealized_pnl_cents,
         }
 
 
@@ -244,6 +260,10 @@ class Orchestrator:
             self.journal.record_event("cycle_error", {"stage": "portfolio", "error": str(exc)})
             return report
 
+        report.open_positions = portfolio.open_position_count
+        report.realized_pnl_cents = portfolio.realized_pnl_today_cents
+        report.unrealized_pnl_cents = portfolio.unrealized_pnl_cents
+
         breaker = evaluate_circuit_breaker(portfolio, self.config.risk)
         report.circuit_breaker_tripped = breaker.tripped
         if breaker.tripped:
@@ -261,6 +281,10 @@ class Orchestrator:
             self._regimes[snapshot.symbol] = regime
             council = self.strategy_agent.decide(signal, regime)
             decision = council.decision
+            if council.gate_passed:
+                report.quant_passes += 1
+            if decision.is_tradable:
+                report.ai_tradable += 1
             report.decisions.append(decision)
             self.journal.record_decision(
                 decision,
@@ -383,6 +407,7 @@ class Orchestrator:
             return
 
         spread = selection.spread
+        report.contracts_selected += 1
         # The client order id must be known before the governor runs, so the
         # duplicate check sees the exact id we would submit.
         from alphamesh.execution.order_builder import build_client_order_id
@@ -411,6 +436,7 @@ class Orchestrator:
             )
             return
 
+        report.risk_approved += 1
         state = transition(state, TradeState.RISK_APPROVED)
         intent = build_order_intent(decision, spread, risk, now)
         state = transition(state, TradeState.CONSTRUCTED)

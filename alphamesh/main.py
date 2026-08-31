@@ -22,6 +22,7 @@ import signal
 import sys
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import FrameType
@@ -35,7 +36,7 @@ from alphamesh.alpaca.mcp_adapter import describe_mcp_usage
 from alphamesh.analytics import build_report
 from alphamesh.config import AppConfig, load_config
 from alphamesh.intelligence.reasoning import build_provider
-from alphamesh.orchestrator import Orchestrator
+from alphamesh.orchestrator import CycleReport, Orchestrator
 from alphamesh.persistence.journal import Journal
 from alphamesh.safety import LiveTradingForbiddenError, banner
 
@@ -570,6 +571,53 @@ def cmd_once(config: AppConfig) -> int:
     return 0
 
 
+@dataclass
+class _Funnel:
+    """Rolling aggregate of the discovery-to-fill funnel.
+
+    Emitted on a wall-clock cadence rather than per cycle: at a 30-second loop
+    the per-cycle line is too noisy to read, and the funnel is what actually
+    shows where candidates are being lost.
+    """
+
+    scans: int = 0
+    quant_pass: int = 0
+    ai_tradable: int = 0
+    contract_selected: int = 0
+    risk_approved: int = 0
+    orders_submitted: int = 0
+    fills: int = 0
+    open_positions: int = 0
+    realized_pnl_cents: int = 0
+    unrealized_pnl_cents: int = 0
+
+    def absorb(self, report: CycleReport) -> None:
+        self.scans += report.symbols_scanned
+        self.quant_pass += report.quant_passes
+        self.ai_tradable += report.ai_tradable
+        self.contract_selected += report.contracts_selected
+        self.risk_approved += report.risk_approved
+        self.orders_submitted += len(report.orders_submitted)
+        self.fills += len(report.exits_taken)
+        # Point-in-time, not cumulative.
+        self.open_positions = report.open_positions
+        self.realized_pnl_cents = report.realized_pnl_cents
+        self.unrealized_pnl_cents = report.unrealized_pnl_cents
+
+    def render(self) -> str:
+        return (
+            f"funnel SCANS={self.scans} QUANT_PASS={self.quant_pass} "
+            f"AI_TRADABLE={self.ai_tradable} CONTRACT_SELECTED={self.contract_selected} "
+            f"RISK_APPROVED={self.risk_approved} ORDERS_SUBMITTED={self.orders_submitted} "
+            f"FILLS={self.fills} OPEN_POSITIONS={self.open_positions} "
+            f"REALIZED_PNL=${self.realized_pnl_cents / 100:.2f} "
+            f"UNREALIZED_PNL=${self.unrealized_pnl_cents / 100:.2f}"
+        )
+
+
+FUNNEL_INTERVAL_SECONDS = 300
+
+
 def cmd_run(config: AppConfig) -> int:
     print(banner(config.settings))
     signal.signal(signal.SIGINT, _handle_signal)
@@ -584,6 +632,8 @@ def cmd_run(config: AppConfig) -> int:
         closed_interval,
         orchestrator.stack.execution_mode,
     )
+    funnel = _Funnel()
+    last_funnel = time.monotonic()
     try:
         orchestrator.startup()
         while not _SHUTDOWN:
@@ -592,14 +642,23 @@ def cmd_run(config: AppConfig) -> int:
             try:
                 report = orchestrator.run_cycle()
                 if report.market_open:
+                    funnel.absorb(report)
                     log.info(
-                        "cycle: scanned=%d orders=%d exits=%d rejections=%d errors=%d",
+                        "cycle: scanned=%d quant_pass=%d ai_tradable=%d selected=%d "
+                        "risk_approved=%d orders=%d exits=%d rejections=%d errors=%d",
                         report.symbols_scanned,
+                        report.quant_passes,
+                        report.ai_tradable,
+                        report.contracts_selected,
+                        report.risk_approved,
                         len(report.orders_submitted),
                         len(report.exits_taken),
                         len(report.rejections),
                         len(report.errors),
                     )
+                    if time.monotonic() - last_funnel >= FUNNEL_INTERVAL_SECONDS:
+                        log.info("%s", funnel.render())
+                        last_funnel = time.monotonic()
                 else:
                     # Closed market: back off hard rather than re-scanning dead
                     # quotes every interval. Never sleep past the next open.

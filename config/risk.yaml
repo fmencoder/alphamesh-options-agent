@@ -14,17 +14,21 @@ high_confidence_threshold: 0.75
 absolute_max_defined_loss: 1000.0
 
 # Portfolio-level caps.
-max_open_positions: 3
-max_portfolio_defined_risk: 3000.0
+max_open_positions: 5
+max_portfolio_defined_risk: 4000.0
 
 # Daily circuit breaker: realized + unrealized loss for the session, in dollars,
 # expressed as a positive number. Breaching it halts all new entries.
 daily_loss_circuit_breaker: 2000.0
 
 # Correlated exposure. Symbols inside one group are treated as a single
-# exposure bucket, because SPY and QQQ are strongly correlated.
+# exposure bucket. Concurrency inside a cluster is constrained, not forbidden:
+# at most 2 simultaneous positions and a capped defined-risk bucket per group,
+# so a single correlated move cannot become the whole portfolio.
 correlation_groups:
-  us_large_cap_beta: [SPY, QQQ]
+  index_beta: [SPY, QQQ, IWM, DIA]
+  high_beta_semis: [NVDA, AMD]
+  mega_high_beta: [TSLA, AAPL]
 max_positions_per_correlation_group: 2
 max_defined_risk_per_correlation_group: 1500.0
 

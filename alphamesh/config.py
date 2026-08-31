@@ -52,7 +52,7 @@ class Settings(BaseModel):
     anthropic_api_key: str = Field(default="", repr=False)
     llm_model: str = "claude-sonnet-5"
     database_path: Path = PROJECT_ROOT / "data" / "alphamesh.db"
-    loop_seconds: int = 60
+    loop_seconds: int = 30
     closed_poll_seconds: int = 300
     dry_run: bool = True
     log_level: str = "INFO"
@@ -101,7 +101,7 @@ def load_settings() -> Settings:
         anthropic_api_key=_env("ANTHROPIC_API_KEY"),
         llm_model=_env("ALPHAMESH_LLM_MODEL") or "claude-sonnet-5",
         database_path=Path(db),
-        loop_seconds=_env_int("ALPHAMESH_LOOP_SECONDS", 60),
+        loop_seconds=_env_int("ALPHAMESH_LOOP_SECONDS", 30),
         closed_poll_seconds=_env_int("ALPHAMESH_CLOSED_POLL_SECONDS", 300),
         dry_run=_env_bool("ALPHAMESH_DRY_RUN", True),
         log_level=_env("ALPHAMESH_LOG_LEVEL") or "INFO",
@@ -173,9 +173,15 @@ class StrategyConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     quant_score_threshold: float
+    regime_thresholds: dict[str, float]
+    absolute_min_quant_threshold: float
+    opening_window_minutes: int
+    opening_weights: dict[str, float]
+    intraday_weights: dict[str, float]
     min_judge_confidence: float
     min_dte: int
     max_dte: int
+    preferred_max_dte: int
     bull_call_spread: dict[str, Any]
     bear_put_spread: dict[str, Any]
     max_debit_to_width_ratio: float

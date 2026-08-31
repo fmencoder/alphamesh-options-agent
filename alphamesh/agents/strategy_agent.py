@@ -24,6 +24,11 @@ from alphamesh.agents.evidence import build_evidence
 from alphamesh.agents.judge_agent import JudgeAgent
 from alphamesh.config import AppConfig
 from alphamesh.intelligence.reasoning import ReasoningProvider
+from alphamesh.intelligence.scoring import (
+    classify_entry_mode,
+    evaluate_gate,
+    profile_for,
+)
 from alphamesh.models.domain import (
     AIArgument,
     Direction,
@@ -55,6 +60,7 @@ class CouncilResult:
     bull: AIArgument | None
     bear: AIArgument | None
     verdict: JudgeVerdict | None
+    gate_passed: bool = False
 
 
 class StrategyAgent:
@@ -92,16 +98,45 @@ class StrategyAgent:
         )
 
     def decide(self, signal: QuantSignal, regime: RegimeAssessment) -> CouncilResult:
-        # 1. Quantitative gate: the AI is not consulted below threshold.
-        if not signal.passes_gate:
-            codes = signal.reason_codes or (ReasonCode.QUANT_SCORE_BELOW_THRESHOLD,)
+        # 1. Quantitative gate: the AI is not consulted below threshold. The
+        #    threshold is regime-conditioned, so it is evaluated here where the
+        #    regime is known rather than inside the score itself.
+        passes, threshold, band, gate_codes = evaluate_gate(
+            signal, regime, self.config.strategies
+        )
+        profile = profile_for(signal.as_of, self.config.strategies)
+        components = {
+            name: signal.features.get(f"score_{name}", 0.0)
+            for name in ("momentum", "trend", "vwap", "participation", "range_position")
+        }
+        log.info(
+            "quant_gate symbol=%s profile=%s regime=%s band=%s score=%.4f "
+            "threshold=%.2f passes=%s entry_mode=%s momentum=%.4f trend=%.4f "
+            "vwap=%.4f participation=%.4f range_position=%.4f",
+            signal.symbol,
+            profile.value,
+            regime.regime.value,
+            band,
+            signal.quant_score,
+            threshold,
+            passes,
+            classify_entry_mode(signal.features, signal.directional_bias).value,
+            components["momentum"],
+            components["trend"],
+            components["vwap"],
+            components["participation"],
+            components["range_position"],
+        )
+
+        if not passes:
+            codes = gate_codes or (ReasonCode.QUANT_SCORE_BELOW_THRESHOLD,)
             return CouncilResult(
                 self._no_trade(
                     signal,
                     regime,
                     (
-                        f"Quant score {signal.quant_score:.3f} below threshold "
-                        f"{self.config.strategies.quant_score_threshold:.3f} "
+                        f"Quant score {signal.quant_score:.3f} below {band} threshold "
+                        f"{threshold:.3f} ({profile.value} profile) "
                         "or directional bias unresolved; AI council not invoked."
                     ),
                     codes,
@@ -109,6 +144,7 @@ class StrategyAgent:
                 None,
                 None,
                 None,
+                gate_passed=False,
             )
 
         # 2. Regime veto, applied before any model cost is incurred.
@@ -128,6 +164,7 @@ class StrategyAgent:
                 None,
                 None,
                 None,
+                gate_passed=True,
             )
 
         # 3. The council debates, then the judge rules.
@@ -150,6 +187,7 @@ class StrategyAgent:
                 bull,
                 bear,
                 verdict,
+                gate_passed=True,
             )
 
         # 4. Confidence floor.
@@ -170,6 +208,7 @@ class StrategyAgent:
                 bull,
                 bear,
                 verdict,
+                gate_passed=True,
             )
 
         direction = (
@@ -192,7 +231,7 @@ class StrategyAgent:
             no_trade_reason=None,
             ai_provider=verdict.provider,
         )
-        return CouncilResult(decision, bull, bear, verdict)
+        return CouncilResult(decision, bull, bear, verdict, gate_passed=True)
 
 
 __all__ = ["CouncilResult", "StrategyAgent", "make_decision_id"]

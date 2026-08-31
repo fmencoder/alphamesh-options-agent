@@ -1,32 +1,75 @@
 # Strategy and contract-selection parameters.
 
 # Quantitative opportunity gate. The AI reasoning council is only invoked when
-# the deterministic quant score clears this threshold, so the agent does not
-# burn LLM calls on every tick.
+# the deterministic quant score clears the applicable threshold, so the agent
+# does not burn LLM calls on every tick.
+#
+# The threshold is regime-conditioned rather than flat. One number cannot be
+# right for both a clean established trend and a chopping range: the same 0.55
+# that is prudent in a range is needlessly restrictive in a confirmed trend,
+# and dangerously permissive in conflicted conditions.
 quant_score_threshold: 0.55
+
+# Regime-conditioned entry thresholds.
+#   strong_trend  a trending regime whose direction agrees with the signal AND
+#                 whose momentum / trend / VWAP components all point the same
+#                 way. This is the only path below the normal threshold.
+#   normal        trending-but-unaligned, or volatility expansion.
+#   range_bound   choppy conditions demand a materially stronger signal.
+# UNKNOWN and UNSTABLE regimes are vetoed outright before this applies.
+#
+# 0.50 is a hard floor. Nothing may lower the gate below it.
+regime_thresholds:
+  strong_trend: 0.50
+  normal: 0.55
+  range_bound: 0.65
+absolute_min_quant_threshold: 0.50
+
+# Session-aware scoring. participation and opening_range_position carry real
+# information in the first half hour and almost none afterwards: once the
+# opening auction imbalance clears, both decay toward zero and drag an
+# otherwise valid trend signal below the gate. After the opening window the
+# score is computed from the three persistent intraday factors only.
+# Both weight sets sum to 1.0, so the score keeps identical [0,1] semantics
+# and the threshold means the same thing under either profile.
+opening_window_minutes: 30
+opening_weights:
+  momentum: 0.30
+  trend: 0.25
+  vwap: 0.15
+  participation: 0.15
+  range_position: 0.15
+intraday_weights:
+  momentum: 0.40
+  trend: 0.35
+  vwap: 0.25
 
 # Judge confidence floor. Below this the decision is downgraded to NO_TRADE.
 min_judge_confidence: 0.55
 
-# Days to expiration window for v1.
+# Days to expiration window.
 min_dte: 2
 max_dte: 10
+# Convexity preference. Both ends of the window stay tradable; when contracts
+# at multiple expiries pass every liquidity gate, the shorter-dated one is
+# preferred for its higher gamma per dollar of defined risk.
+preferred_max_dte: 7
 
 # Target deltas. Selection picks the closest eligible contract; an exact match
 # is never required.
 bull_call_spread:
-  long_delta_target: 0.55
-  long_delta_range: [0.45, 0.65]
-  short_delta_target: 0.30
-  short_delta_range: [0.20, 0.40]
+  long_delta_target: 0.58
+  long_delta_range: [0.50, 0.65]
+  short_delta_target: 0.32
+  short_delta_range: [0.25, 0.40]
   min_strike_width: 1.0
   max_strike_width: 15.0
 
 bear_put_spread:
-  long_delta_target: -0.55
-  long_delta_range: [-0.65, -0.45]
-  short_delta_target: -0.30
-  short_delta_range: [-0.40, -0.20]
+  long_delta_target: -0.58
+  long_delta_range: [-0.65, -0.50]
+  short_delta_target: -0.32
+  short_delta_range: [-0.40, -0.25]
   min_strike_width: 1.0
   max_strike_width: 15.0
 

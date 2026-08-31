@@ -29,7 +29,7 @@ def parse_flags(text: str) -> dict[str, str]:
 
 @pytest.fixture
 def preflight_config(tmp_path):  # type: ignore[no-untyped-def]
-    return load_config(
+    return _captured_universe(load_config(
         settings=Settings(
             paper=True,
             dry_run=True,
@@ -37,6 +37,20 @@ def preflight_config(tmp_path):  # type: ignore[no-untyped-def]
             capture_dir=CAPTURE_DIR,
             database_path=tmp_path / "preflight.db",
         )
+    ))
+
+
+
+def _captured_universe(config):  # type: ignore[no-untyped-def]
+    """Pin the universe to the symbols the offline capture actually contains.
+
+    The live universe is eight symbols; the MCP capture fixtures cover SPY and
+    QQQ. Preflight correctly fails when asked for data that genuinely is not
+    there, so these offline tests scope the universe to what was captured
+    rather than relaxing the gate.
+    """
+    return config.model_copy(
+        update={"universe": config.universe.model_copy(update={"symbols": ["SPY", "QQQ"]})}
     )
 
 

@@ -1,9 +1,21 @@
-# Trading universe for v1. Deliberately narrow: both symbols are deeply liquid
-# index ETFs with penny-wide option markets. Do not broaden until the core
-# lifecycle is proven.
+# Trading universe. Expanded for the competition from the original SPY/QQQ pair
+# to eight deeply liquid, penny-or-near-penny option markets across three
+# correlation clusters, so opportunity capture is not bottlenecked on two
+# names moving together.
+#
+# Breadth is safe here only because every symbol still passes the same
+# per-contract liquidity, quote-freshness and Greeks gates. A symbol whose
+# chain is unavailable, whose Greeks are missing, whose quotes are stale or
+# whose contracts are genuinely illiquid is skipped, not traded.
 symbols:
   - SPY
   - QQQ
+  - IWM
+  - DIA
+  - NVDA
+  - TSLA
+  - AMD
+  - AAPL
 
 # Minimum 1-minute bars required before features are considered valid.
 min_bars_required: 60

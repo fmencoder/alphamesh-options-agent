@@ -213,9 +213,13 @@ def select_vertical_spread(
                 delta_error = abs(
                     (long_c.greeks.delta or 0.0) - long_target
                 ) + abs((short_c.greeks.delta or 0.0) - short_target)
-                # Deterministic ordering: nearest expiry, closest to target
-                # deltas, then cheapest relative to width, then strike.
+                # Deterministic ordering: preferred-DTE band first (convexity
+                # preference -- longer-dated contracts stay tradable, they just
+                # rank behind), then nearest expiry, closest to target deltas,
+                # then cheapest relative to width, then strike.
+                dte = (spread.expiration - today).days
                 key = (
+                    0.0 if dte <= strategies.preferred_max_dte else 1.0,
                     float(spread.expiration.toordinal()),
                     round(delta_error, 6),
                     round(ratio, 6),

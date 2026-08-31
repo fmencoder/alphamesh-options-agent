@@ -118,18 +118,34 @@ def run_preflight(monkeypatch, capsys, market, tmp_path):  # type: ignore[no-unt
         live_broker=False,
     )
     monkeypatch.setattr("alphamesh.main.build_stack", lambda _s: stack)
-    config = load_config(
-        settings=Settings(
-            paper=True,
-            dry_run=True,
-            data_source="mcp_capture",
-            capture_dir=CAPTURE_DIR,
-            database_path=tmp_path / "pf.db",
+    config = _captured_universe(
+        load_config(
+            settings=Settings(
+                paper=True,
+                dry_run=True,
+                data_source="mcp_capture",
+                capture_dir=CAPTURE_DIR,
+                database_path=tmp_path / "pf.db",
+            )
         )
     )
     code = cmd_preflight(config)
     out = capsys.readouterr().out
     return code, parse_flags(out), out, broker
+
+
+
+def _captured_universe(config):  # type: ignore[no-untyped-def]
+    """Pin the universe to the symbols the offline capture actually contains.
+
+    The live universe is eight symbols; the MCP capture fixtures cover SPY and
+    QQQ. Preflight correctly fails when asked for data that genuinely is not
+    there, so these offline tests scope the universe to what was captured
+    rather than relaxing the gate.
+    """
+    return config.model_copy(
+        update={"universe": config.universe.model_copy(update={"symbols": ["SPY", "QQQ"]})}
+    )
 
 
 class TestClosedMarketPreflightPasses:

@@ -174,14 +174,18 @@ class TestPortfolioCap:
         assert result.max_loss_cents <= 10_000
 
     def test_exhausted_portfolio_risk_rejects(self, governor) -> None:  # type: ignore[no-untyped-def]
+        # Ungrouped symbols, so the portfolio cap is the binding constraint
+        # rather than a correlation bucket. $1500 + $1500 + $1000 = the
+        # $4000 aggregate ceiling exactly.
         portfolio = make_portfolio(
             open_positions=(
-                open_position("SPY", 150_000, "p1"),
-                open_position("QQQ", 150_000, "p2"),
+                open_position("AAA", 150_000, "p1"),
+                open_position("BBB", 150_000, "p2"),
+                open_position("CCC", 100_000, "p3"),
             )
         )
         result = governor.approve(
-            make_decision(symbol="IWM"), spread_with(100, symbol="IWM"), portfolio, NOW, "c"
+            make_decision(symbol="DDD"), spread_with(100, symbol="DDD"), portfolio, NOW, "c"
         )
         assert not result.approved
         assert ReasonCode.MAX_PORTFOLIO_RISK in result.reason_codes
@@ -192,7 +196,7 @@ class TestOpenPositionCount:
         portfolio = make_portfolio(
             open_positions=tuple(
                 open_position(s, 10_000, f"p{i}")
-                for i, s in enumerate(["AAA", "BBB", "CCC"])
+                for i, s in enumerate(["AAA", "BBB", "CCC", "DDD", "EEE"])
             )
         )
         result = governor.approve(
