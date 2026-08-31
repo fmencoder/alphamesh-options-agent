@@ -160,6 +160,30 @@ class RiskGovernor:
             )
         v.checks.append("duplicate_order")
 
+        # 6b. Broker truth. The journal gates above can only see what this
+        #     process recorded; a restart, a lost write or an out-of-band fill
+        #     leaves them blind. New exposure therefore requires BOTH the
+        #     journal AND the account to permit it. Direction is irrelevant:
+        #     an opposing spread on the same underlying is still a second
+        #     position on that underlying.
+        if portfolio.broker_has_position_for(decision.symbol):
+            v.fail(
+                ReasonCode.BROKER_OPEN_POSITION,
+                f"the broker already reports an open option position in {decision.symbol}",
+            )
+        if not portfolio.broker_truth_available:
+            # Ambiguous state is not a licence to add risk.
+            v.fail(
+                ReasonCode.BROKER_OPEN_POSITION,
+                "broker exposure could not be read; refusing new exposure",
+            )
+        if portfolio.broker_has_working_order_for(decision.symbol):
+            v.fail(
+                ReasonCode.BROKER_WORKING_ORDER,
+                f"the broker already reports a working order in {decision.symbol}",
+            )
+        v.checks.append("broker_truth")
+
         # 7. Daily circuit breaker.
         breaker = evaluate_circuit_breaker(portfolio, limits)
         if breaker.tripped:

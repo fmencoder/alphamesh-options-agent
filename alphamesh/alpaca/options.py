@@ -252,6 +252,19 @@ def parse_occ_symbol(symbol: str) -> tuple[date, OptionType, float] | None:
     return expiration, opt_type, strike
 
 
+def occ_underlying(symbol: str) -> str | None:
+    """Root ticker of an OCC option symbol, e.g. NVDA260902C00220000 -> NVDA.
+
+    The OCC tail is fixed width, so the root is whatever precedes it.
+    """
+    if len(symbol) < 16:
+        return None
+    if parse_occ_symbol(symbol) is None:
+        return None
+    root = symbol[:-15].strip().upper()
+    return root or None
+
+
 def build_occ_symbol(
     underlying: str, expiration: date, option_type: OptionType, strike: float
 ) -> str:
@@ -272,5 +285,6 @@ __all__ = [
     "OptionChainProvider",
     "build_occ_symbol",
     "load_option_snapshots_csv",
+    "occ_underlying",
     "parse_occ_symbol",
 ]

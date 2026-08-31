@@ -191,6 +191,10 @@ def make_account(
 
 def make_portfolio(**kwargs) -> PortfolioState:  # type: ignore[no-untyped-def]
     kwargs.setdefault("account", make_account())
+    # A readable broker reporting no exposure is the normal case. The
+    # production default stays False so an unreadable broker fails closed;
+    # tests that care about that set it explicitly.
+    kwargs.setdefault("broker_truth_available", True)
     return PortfolioState(**kwargs)
 
 

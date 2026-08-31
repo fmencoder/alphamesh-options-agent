@@ -23,8 +23,20 @@ class PortfolioState:
     # so the open-position gates cannot see it.
     working_order_symbols: frozenset[str] = field(default_factory=frozenset)
 
+    # Broker truth, read from the account rather than the journal. The journal
+    # can diverge; for blocking NEW exposure the broker is authoritative.
+    broker_position_symbols: frozenset[str] = field(default_factory=frozenset)
+    broker_working_symbols: frozenset[str] = field(default_factory=frozenset)
+    broker_truth_available: bool = False
+
     def has_working_order_for(self, symbol: str) -> bool:
         return symbol.upper() in {s.upper() for s in self.working_order_symbols}
+
+    def broker_has_position_for(self, symbol: str) -> bool:
+        return symbol.upper() in {s.upper() for s in self.broker_position_symbols}
+
+    def broker_has_working_order_for(self, symbol: str) -> bool:
+        return symbol.upper() in {s.upper() for s in self.broker_working_symbols}
 
     @property
     def open_position_count(self) -> int:

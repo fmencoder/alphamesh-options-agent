@@ -80,7 +80,13 @@ class TestZeroOrderBroker:
             if not name.startswith("_") and callable(getattr(Broker, name, None))
         }
         assert writes <= protocol_methods
-        unguarded = protocol_methods - writes - {"account", "positions", "get_order_by_client_id"}
+        reads = {
+            "account",
+            "positions",
+            "get_order_by_client_id",
+            "working_order_symbols",
+        }
+        unguarded = protocol_methods - writes - reads
         assert unguarded == set(), f"unguarded broker methods: {unguarded}"
 
 

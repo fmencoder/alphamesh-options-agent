@@ -16,6 +16,7 @@ import logging
 from datetime import UTC, datetime
 from typing import Any, Protocol, runtime_checkable
 
+from alphamesh.alpaca.options import occ_underlying
 from alphamesh.alpaca.types import AccountState, BrokerPosition
 from alphamesh.execution.order_builder import to_alpaca_payload
 from alphamesh.models.domain import ExecutionRecord, OrderIntent
@@ -55,6 +56,8 @@ class Broker(Protocol):
     ) -> ExecutionRecord: ...
 
     def positions(self) -> list[BrokerPosition]: ...
+
+    def working_order_symbols(self) -> frozenset[str]: ...
 
 
 # --------------------------------------------------------------------------- #
@@ -184,6 +187,24 @@ class AlpacaPaperBroker:
     def cancel_order(self, broker_order_id: str) -> None:
         self._request("DELETE", f"/v2/orders/{broker_order_id}")
 
+    def working_order_symbols(self) -> frozenset[str]:
+        """Underlyings with a live order at the broker, from the account itself.
+
+        Multi-leg option orders carry the OCC symbols on their legs, so the
+        parent's own symbol field is empty and the roots come from the legs.
+        """
+        data = self._request("GET", "/v2/orders", params={"status": "open", "nested": "true"})
+        roots: set[str] = set()
+        for order in data or []:
+            candidates = [order, *(order.get("legs") or [])]
+            for item in candidates:
+                symbol = str(item.get("symbol") or "")
+                if not symbol:
+                    continue
+                root = occ_underlying(symbol) or symbol.upper()
+                roots.add(root)
+        return frozenset(roots)
+
     def positions(self) -> list[BrokerPosition]:
         data = self._request("GET", "/v2/positions")
         return [
@@ -226,6 +247,9 @@ def _parse_dt(value: Any) -> datetime | None:
 # --------------------------------------------------------------------------- #
 # Simulator
 # --------------------------------------------------------------------------- #
+_SIM_LIVE_STATUSES = frozenset({"new", "accepted", "pending_new", "partially_filled"})
+
+
 class SimulatedBroker:
     """Deterministic in-process broker for tests and dry runs.
 
@@ -246,6 +270,9 @@ class SimulatedBroker:
         self.submitted_payloads: list[dict[str, Any]] = []
         self._fail_next = fail_next_submit_with
         self._seq = 0
+        # OCC symbols per order, so working exposure can be reported by
+        # underlying exactly as the real broker does.
+        self.legs_by_client_order_id: dict[str, tuple[str, ...]] = {}
 
     def account(self) -> AccountState:
         check_account_number(self._account.account_number)
@@ -261,6 +288,9 @@ class SimulatedBroker:
         if intent.client_order_id in self.orders:
             raise BrokerError(f"duplicate client_order_id {intent.client_order_id}")
         self.submitted_payloads.append(to_alpaca_payload(intent))
+        self.legs_by_client_order_id[intent.client_order_id] = tuple(
+            leg.contract.symbol for leg in intent.legs
+        )
         return self._record(intent.client_order_id, intent.quantity, intent.limit_price_cents)
 
     def close_spread(
@@ -295,6 +325,16 @@ class SimulatedBroker:
                 self.orders[cid] = record.model_copy(
                     update={"status": "canceled", "raw_status": "canceled"}
                 )
+
+    def working_order_symbols(self) -> frozenset[str]:
+        roots: set[str] = set()
+        for record in self.orders.values():
+            if record.status.lower() not in _SIM_LIVE_STATUSES:
+                continue
+            for leg in self.legs_by_client_order_id.get(record.client_order_id, ()):
+                root = occ_underlying(leg) or leg.upper()
+                roots.add(root)
+        return frozenset(roots)
 
     def positions(self) -> list[BrokerPosition]:
         return []

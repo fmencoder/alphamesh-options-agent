@@ -126,6 +126,10 @@ class ReasonCode(StrEnum):
     AI_UNSUPPORTED_STRATEGY = "AI_UNSUPPORTED_STRATEGY"
     AI_UNAVAILABLE = "AI_UNAVAILABLE"
     DIRECTION_CONFLICT = "DIRECTION_CONFLICT"
+    # Broker truth. The journal can diverge from the account; for blocking new
+    # exposure the broker is authoritative.
+    BROKER_OPEN_POSITION = "BROKER_OPEN_POSITION"
+    BROKER_WORKING_ORDER = "BROKER_WORKING_ORDER"
     # Market state
     MARKET_CLOSED = "MARKET_CLOSED"
     TOO_CLOSE_TO_CLOSE = "TOO_CLOSE_TO_CLOSE"

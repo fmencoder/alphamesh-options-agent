@@ -23,6 +23,7 @@ from alphamesh.agents.regime_agent import RegimeAgent
 from alphamesh.agents.strategy_agent import CouncilResult, StrategyAgent
 from alphamesh.alpaca.client import AlpacaStack
 from alphamesh.alpaca.execution import AmbiguousSubmissionError, BrokerError
+from alphamesh.alpaca.options import occ_underlying
 from alphamesh.alpaca.types import MarketClock
 from alphamesh.config import AppConfig
 from alphamesh.execution.exits import evaluate_exit
@@ -185,16 +186,69 @@ class Orchestrator:
         positions = tuple(self.journal.open_positions())
         unrealized = self._unrealized_pnl_cents(positions, now)
         today = (now or datetime.now(UTC)).date().isoformat()
+        journal_working = frozenset(
+            str(o["symbol"]) for o in self.journal.open_orders() if o.get("symbol")
+        )
+        broker_positions, broker_working, broker_ok = self._broker_exposure()
+        journal_exposed = {p.symbol.upper() for p in positions} | {
+            s.upper() for s in journal_working
+        }
+        broker_exposed = {s.upper() for s in broker_positions} | {
+            s.upper() for s in broker_working
+        }
+        if broker_ok and journal_exposed != broker_exposed:
+            only_broker = sorted(broker_exposed - journal_exposed)
+            only_journal = sorted(journal_exposed - broker_exposed)
+            log.warning(
+                "exposure_state_mismatch only_broker=%s only_journal=%s "
+                "broker_positions=%s broker_working=%s journal_positions=%s "
+                "journal_working=%s resolution=BROKER_WINS_FOR_BLOCKING",
+                only_broker,
+                only_journal,
+                sorted(broker_positions),
+                sorted(broker_working),
+                sorted(p.symbol for p in positions),
+                sorted(journal_working),
+            )
+            self.journal.record_event(
+                "exposure_state_mismatch",
+                {
+                    "only_broker": only_broker,
+                    "only_journal": only_journal,
+                    "resolution": "BROKER_WINS_FOR_BLOCKING",
+                },
+            )
         return PortfolioState(
             account=account,
             open_positions=positions,
             realized_pnl_today_cents=self.journal.realized_pnl_cents(since_iso=today),
             unrealized_pnl_cents=unrealized,
             open_client_order_ids=frozenset(p.client_order_id for p in positions),
-            working_order_symbols=frozenset(
-                str(o["symbol"]) for o in self.journal.open_orders() if o.get("symbol")
-            ),
+            working_order_symbols=journal_working,
+            broker_position_symbols=broker_positions,
+            broker_working_symbols=broker_working,
+            broker_truth_available=broker_ok,
         )
+
+    def _broker_exposure(self) -> tuple[frozenset[str], frozenset[str], bool]:
+        """Underlyings the ACCOUNT says are exposed, by position and by order.
+
+        Returns ``available=False`` only when the broker cannot be read at all.
+        Callers must treat that as ambiguous state and refuse new exposure
+        rather than fall back to the journal, which is exactly the blind spot
+        this guard exists to close.
+        """
+        try:
+            positions = frozenset(
+                root
+                for p in self.stack.broker.positions()
+                if (root := (occ_underlying(p.symbol) or p.symbol.upper()))
+            )
+            working = frozenset(self.stack.broker.working_order_symbols())
+        except Exception as exc:
+            log.warning("broker exposure unreadable; refusing new exposure: %s", exc)
+            return frozenset(), frozenset(), False
+        return positions, working, True
 
     def _unrealized_pnl_cents(
         self, positions: tuple[PositionRecord, ...], now: datetime | None = None
