@@ -257,3 +257,47 @@ class TestRuntimeCadence:
 
         signal = build_quant_signal(make_snapshot(), STRATEGIES, CONFIG.universe)
         assert 0.0 <= signal.quant_score <= 1.0
+
+
+class TestFunnelCounters:
+    """FILLS must mean entry fills. It briefly counted exits and read 0 while
+    three spreads were filled and open."""
+
+    def test_fills_counts_entries_and_exits_are_separate(self) -> None:
+        from datetime import datetime as _dt
+
+        from alphamesh.main import _Funnel
+        from alphamesh.orchestrator import CycleReport
+
+        funnel = _Funnel()
+        report = CycleReport(started_at=_dt(2026, 8, 31, 16, 0, tzinfo=UTC))
+        report.symbols_scanned = 8
+        report.quant_passes = 3
+        report.ai_tradable = 2
+        report.contracts_selected = 2
+        report.risk_approved = 2
+        report.orders_submitted = ["a", "b"]
+        report.entry_fills = 2
+        report.exits_taken = []
+        funnel.absorb(report)
+
+        assert funnel.fills == 2
+        assert funnel.exits == 0
+        rendered = funnel.render()
+        assert "FILLS=2" in rendered
+        assert "EXITS=0" in rendered
+        assert "SCANS=8" in rendered
+
+    def test_exits_do_not_inflate_fills(self) -> None:
+        from datetime import datetime as _dt
+
+        from alphamesh.main import _Funnel
+        from alphamesh.orchestrator import CycleReport
+
+        funnel = _Funnel()
+        report = CycleReport(started_at=_dt(2026, 8, 31, 16, 0, tzinfo=UTC))
+        report.entry_fills = 0
+        report.exits_taken = ["closed-one"]
+        funnel.absorb(report)
+        assert funnel.fills == 0
+        assert funnel.exits == 1

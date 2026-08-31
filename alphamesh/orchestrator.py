@@ -83,6 +83,7 @@ class CycleReport:
     # sequence reads as a strict narrowing from scan to fill.
     quant_passes: int = 0
     ai_tradable: int = 0
+    entry_fills: int = 0
     contracts_selected: int = 0
     risk_approved: int = 0
     open_positions: int = 0
@@ -114,6 +115,7 @@ class CycleReport:
             "circuit_breaker_tripped": self.circuit_breaker_tripped,
             "quant_passes": self.quant_passes,
             "ai_tradable": self.ai_tradable,
+            "entry_fills": self.entry_fills,
             "contracts_selected": self.contracts_selected,
             "risk_approved": self.risk_approved,
             "open_positions": self.open_positions,
@@ -503,6 +505,7 @@ class Orchestrator:
 
         refreshed = self.monitor.refresh(intent.client_order_id) or record
         if refreshed.filled_quantity > 0:
+            report.entry_fills += 1
             self._open_position(decision, intent, refreshed, risk, now)
 
     def _assert_paper_before_submit(self) -> None:

@@ -587,6 +587,7 @@ class _Funnel:
     risk_approved: int = 0
     orders_submitted: int = 0
     fills: int = 0
+    exits: int = 0
     open_positions: int = 0
     realized_pnl_cents: int = 0
     unrealized_pnl_cents: int = 0
@@ -598,7 +599,10 @@ class _Funnel:
         self.contract_selected += report.contracts_selected
         self.risk_approved += report.risk_approved
         self.orders_submitted += len(report.orders_submitted)
-        self.fills += len(report.exits_taken)
+        # Entry fills, not exits. Counting exits here reported FILLS=0 while
+        # three spreads were filled and open.
+        self.fills += report.entry_fills
+        self.exits += len(report.exits_taken)
         # Point-in-time, not cumulative.
         self.open_positions = report.open_positions
         self.realized_pnl_cents = report.realized_pnl_cents
@@ -609,7 +613,7 @@ class _Funnel:
             f"funnel SCANS={self.scans} QUANT_PASS={self.quant_pass} "
             f"AI_TRADABLE={self.ai_tradable} CONTRACT_SELECTED={self.contract_selected} "
             f"RISK_APPROVED={self.risk_approved} ORDERS_SUBMITTED={self.orders_submitted} "
-            f"FILLS={self.fills} OPEN_POSITIONS={self.open_positions} "
+            f"FILLS={self.fills} EXITS={self.exits} OPEN_POSITIONS={self.open_positions} "
             f"REALIZED_PNL=${self.realized_pnl_cents / 100:.2f} "
             f"UNREALIZED_PNL=${self.unrealized_pnl_cents / 100:.2f}"
         )
