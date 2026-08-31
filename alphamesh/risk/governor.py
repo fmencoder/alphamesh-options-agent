@@ -149,6 +149,15 @@ class RiskGovernor:
                 ReasonCode.DUPLICATE_ORDER,
                 f"an open position already exists for {decision.symbol}",
             )
+        # An unfilled working order is exposure in waiting. Without this the
+        # id-based check above is defeated by a moving limit price: every cycle
+        # mints a fresh client_order_id for the same spread and stacks another
+        # live order on top of the last one.
+        if portfolio.has_working_order_for(decision.symbol):
+            v.fail(
+                ReasonCode.DUPLICATE_ORDER,
+                f"a working order is already live for {decision.symbol}",
+            )
         v.checks.append("duplicate_order")
 
         # 7. Daily circuit breaker.

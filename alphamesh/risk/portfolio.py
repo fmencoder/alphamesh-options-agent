@@ -18,6 +18,13 @@ class PortfolioState:
     realized_pnl_today_cents: int = 0
     unrealized_pnl_cents: int = 0
     open_client_order_ids: frozenset[str] = field(default_factory=frozenset)
+    # Underlyings with a live order that has not reached a terminal state.
+    # A working order is real exposure-in-waiting: it is not yet a position,
+    # so the open-position gates cannot see it.
+    working_order_symbols: frozenset[str] = field(default_factory=frozenset)
+
+    def has_working_order_for(self, symbol: str) -> bool:
+        return symbol.upper() in {s.upper() for s in self.working_order_symbols}
 
     @property
     def open_position_count(self) -> int:

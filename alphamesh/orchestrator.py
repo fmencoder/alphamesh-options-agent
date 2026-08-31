@@ -175,6 +175,9 @@ class Orchestrator:
             realized_pnl_today_cents=self.journal.realized_pnl_cents(since_iso=today),
             unrealized_pnl_cents=unrealized,
             open_client_order_ids=frozenset(p.client_order_id for p in positions),
+            working_order_symbols=frozenset(
+                str(o["symbol"]) for o in self.journal.open_orders() if o.get("symbol")
+            ),
         )
 
     def _unrealized_pnl_cents(

@@ -414,3 +414,54 @@ class TestGovernorImmutability:
             cap = limits.cap_cents_for_confidence(confidence)
             assert cap <= int(limits.absolute_max_defined_loss * 100)
             assert cap >= int(limits.max_defined_loss_per_trade * 100) or confidence < 0.75
+
+
+class TestWorkingOrderStacking:
+    """Regression: three live AMD orders stacked in production on 2026-08-31.
+
+    The id-based duplicate gate was defeated by a moving limit price. Each
+    cycle rebuilt the same spread at a slightly different price, minting a
+    fresh client_order_id, and the open-position gate could not see an order
+    that had not filled yet. Three identical spreads went live at 4.30, 4.38
+    and 4.32 within three minutes.
+    """
+
+    def test_a_working_order_blocks_a_second_entry(self, governor) -> None:  # type: ignore[no-untyped-def]
+        portfolio = make_portfolio(working_order_symbols=frozenset({"AMD"}))
+        result = governor.approve(
+            make_decision(symbol="AMD"),
+            spread_with(100, symbol="AMD"),
+            portfolio,
+            NOW,
+            "a-brand-new-client-order-id",
+        )
+        assert not result.approved
+        assert ReasonCode.DUPLICATE_ORDER in result.reason_codes
+
+    def test_a_different_limit_price_does_not_defeat_the_gate(self, governor) -> None:  # type: ignore[no-untyped-def]
+        """The exact production failure: new id, same underlying, still blocked."""
+        portfolio = make_portfolio(working_order_symbols=frozenset({"AMD"}))
+        for client_order_id in ("alphamesh-AMD-BCS-aaaa", "alphamesh-AMD-BCS-bbbb"):
+            result = governor.approve(
+                make_decision(symbol="AMD"),
+                spread_with(100, symbol="AMD"),
+                portfolio,
+                NOW,
+                client_order_id,
+            )
+            assert not result.approved, client_order_id
+            assert ReasonCode.DUPLICATE_ORDER in result.reason_codes
+
+    def test_an_unrelated_symbol_is_unaffected(self, governor) -> None:  # type: ignore[no-untyped-def]
+        portfolio = make_portfolio(working_order_symbols=frozenset({"AMD"}))
+        result = governor.approve(
+            make_decision(symbol="SPY"), spread_with(100, symbol="SPY"), portfolio, NOW, "c"
+        )
+        assert result.approved
+
+    def test_symbol_matching_is_case_insensitive(self, governor) -> None:  # type: ignore[no-untyped-def]
+        portfolio = make_portfolio(working_order_symbols=frozenset({"amd"}))
+        result = governor.approve(
+            make_decision(symbol="AMD"), spread_with(100, symbol="AMD"), portfolio, NOW, "c"
+        )
+        assert not result.approved
