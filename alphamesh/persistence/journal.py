@@ -32,7 +32,11 @@ from alphamesh.models.domain import (
     TradeOutcome,
     TradeState,
 )
-from alphamesh.persistence.models import SCHEMA, SCHEMA_VERSION
+from alphamesh.persistence.models import (
+    POST_MIGRATION_INDEXES,
+    SCHEMA,
+    SCHEMA_VERSION,
+)
 
 SECRET_KEY_MARKERS: tuple[str, ...] = (
     "api_key",
@@ -48,6 +52,15 @@ SECRET_KEY_MARKERS: tuple[str, ...] = (
     "private",
 )
 REDACTED = "<redacted>"
+
+ORDER_KIND_ENTRY = "ENTRY"
+ORDER_KIND_EXIT = "EXIT"
+
+POSITION_ORIGIN_AGENT = "AGENT"
+POSITION_ORIGIN_ADOPTED = "ADOPTED"
+
+#: Marks an outcome that was written without a broker closing order behind it.
+PHANTOM_CLOSE_NOTE = "PHANTOM_NO_BROKER_EXIT_ORDER"
 
 
 def redact(value: Any) -> Any:
@@ -89,10 +102,38 @@ class Journal:
         self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA)
+        self._migrate()
         self._conn.execute(
             "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('version', ?)",
             (str(SCHEMA_VERSION),),
         )
+        self._conn.commit()
+
+    # A journal written by an older build already exists on the production
+    # volume, and CREATE TABLE IF NOT EXISTS silently leaves its columns alone.
+    # Every column added after v1 therefore has to be applied by hand, additively
+    # -- nothing is dropped or rewritten, so an old row keeps its history and
+    # simply takes the default for the new column.
+    _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+        ("orders", "kind", "TEXT NOT NULL DEFAULT 'ENTRY'"),
+        ("orders", "position_id", "TEXT"),
+        ("positions", "origin", "TEXT NOT NULL DEFAULT 'AGENT'"),
+        ("positions", "entry_basis", "TEXT NOT NULL DEFAULT 'FILL'"),
+        ("outcomes", "reconciliation_note", "TEXT"),
+    )
+
+    def _migrate(self) -> None:
+        for table, column, ddl in self._ADDED_COLUMNS:
+            existing = {
+                str(row["name"])
+                for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            if not existing or column in existing:
+                continue
+            self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+        # Only now that every column exists can they be indexed.
+        for statement in POST_MIGRATION_INDEXES:
+            self._conn.execute(statement)
         self._conn.commit()
 
     def close(self) -> None:
@@ -213,13 +254,22 @@ class Journal:
         return [dict(r) for r in rows]
 
     # ---------------------------------------------------------------- orders
-    def reserve_order(self, intent: OrderIntent) -> bool:
+    def reserve_order(
+        self,
+        intent: OrderIntent,
+        kind: str = ORDER_KIND_ENTRY,
+        position_id: str | None = None,
+    ) -> bool:
         """Persist the order intent *before* it is sent.
 
         Returns False when this ``client_order_id`` is already reserved, which
         is what makes submission idempotent across a crash: the row exists
         before the network call, so a restart finds it and reconciles instead of
         sending a second order.
+
+        ``kind`` separates the order that opens a position from the one that
+        closes it. The entry TTL sweep must never retire an exit order, and an
+        exit must be findable from its position.
         """
         try:
             with self.transaction() as conn:
@@ -228,8 +278,8 @@ class Journal:
                     INSERT INTO orders(
                         client_order_id, decision_id, symbol, strategy, quantity,
                         limit_price_cents, max_loss_cents, legs, state,
-                        created_at, updated_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                        created_at, updated_at, kind, position_id)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         intent.client_order_id,
@@ -243,11 +293,35 @@ class Journal:
                         TradeState.CONSTRUCTED.value,
                         intent.created_at.isoformat(),
                         _now(),
+                        kind,
+                        position_id,
                     ),
                 )
             return True
         except sqlite3.IntegrityError:
             return False
+
+    def exit_order_count(self, position_id: str) -> int:
+        """How many closing orders have been raised for this position.
+
+        Used as the attempt number in the exit order id, so a close that was
+        confirmed dead can be re-quoted under a fresh id. It is read from the
+        journal rather than held in memory, so it survives a restart.
+        """
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM orders WHERE position_id = ? AND kind = ?",
+            (position_id, ORDER_KIND_EXIT),
+        ).fetchone()
+        return int(row["n"])
+
+    def exit_order_for(self, position_id: str) -> dict[str, Any] | None:
+        """The most recent closing order raised for one position, if any."""
+        row = self._conn.execute(
+            "SELECT * FROM orders WHERE position_id = ? AND kind = ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (position_id, ORDER_KIND_EXIT),
+        ).fetchone()
+        return dict(row) if row else None
 
     def order_exists(self, client_order_id: str) -> bool:
         row = self._conn.execute(
@@ -303,17 +377,23 @@ class Journal:
         ).fetchone()
         return dict(row) if row else None
 
-    def open_orders(self) -> list[dict[str, Any]]:
-        """Orders in a non-terminal state, for restart recovery."""
+    def open_orders(self, kind: str | None = None) -> list[dict[str, Any]]:
+        """Orders in a non-terminal state, for restart recovery.
+
+        ``kind`` narrows to entry or exit orders; the TTL sweep uses it so a
+        closing order is never mistaken for a stale entry and cancelled.
+        """
         terminal = (
             TradeState.CLOSED.value,
             TradeState.REJECTED.value,
             TradeState.FAILED.value,
         )
-        rows = self._conn.execute(
-            f"SELECT * FROM orders WHERE state NOT IN ({','.join('?' * len(terminal))})",
-            terminal,
-        ).fetchall()
+        sql = f"SELECT * FROM orders WHERE state NOT IN ({','.join('?' * len(terminal))})"
+        params: tuple[Any, ...] = terminal
+        if kind is not None:
+            sql += " AND kind = ?"
+            params = (*terminal, kind)
+        rows = self._conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
 
     def transitions_for(self, client_order_id: str) -> list[dict[str, Any]]:
@@ -324,15 +404,21 @@ class Journal:
         return [dict(r) for r in rows]
 
     # ------------------------------------------------------------- positions
-    def record_position(self, position: PositionRecord) -> None:
+    def record_position(
+        self,
+        position: PositionRecord,
+        origin: str = POSITION_ORIGIN_AGENT,
+        entry_basis: str = "FILL",
+    ) -> None:
         with self.transaction() as conn:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO positions(
                     position_id, decision_id, client_order_id, symbol, strategy,
                     quantity, entry_debit_cents, max_loss_cents, max_profit_cents,
-                    opened_at, expiration, long_symbol, short_symbol, state)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    opened_at, expiration, long_symbol, short_symbol, state,
+                    origin, entry_basis)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     position.position_id,
@@ -349,6 +435,8 @@ class Journal:
                     position.long_symbol,
                     position.short_symbol,
                     position.state.value,
+                    origin,
+                    entry_basis,
                 ),
             )
 
@@ -410,7 +498,9 @@ class Journal:
         )
 
     # -------------------------------------------------------------- outcomes
-    def record_outcome(self, outcome: TradeOutcome) -> None:
+    def record_outcome(
+        self, outcome: TradeOutcome, reconciliation_note: str | None = None
+    ) -> None:
         with self.transaction() as conn:
             conn.execute(
                 """
@@ -418,8 +508,8 @@ class Journal:
                     position_id, decision_id, symbol, strategy, regime, confidence,
                     quantity, entry_debit_cents, exit_value_cents, realized_pnl_cents,
                     return_on_defined_risk, holding_minutes, mfe_cents, mae_cents,
-                    exit_reason, opened_at, closed_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    exit_reason, opened_at, closed_at, reconciliation_note)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     outcome.position_id,
@@ -439,6 +529,7 @@ class Journal:
                     outcome.exit_reason.value,
                     outcome.opened_at.isoformat(),
                     outcome.closed_at.isoformat(),
+                    reconciliation_note,
                 ),
             )
             conn.execute(
@@ -455,17 +546,56 @@ class Journal:
         return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
 
     def realized_pnl_cents(self, since_iso: str | None = None) -> int:
+        """Realised profit and loss from outcomes backed by a real closing fill.
+
+        An outcome carrying a ``reconciliation_note`` was written without a
+        broker closing order behind it. The row is kept for the audit trail, but
+        its money was never earned, so it is excluded from every total rather
+        than being allowed to misreport performance.
+        """
         if since_iso:
             row = self._conn.execute(
                 "SELECT COALESCE(SUM(realized_pnl_cents), 0) AS total FROM outcomes "
-                "WHERE closed_at >= ?",
+                "WHERE closed_at >= ? AND reconciliation_note IS NULL",
                 (since_iso,),
             ).fetchone()
         else:
             row = self._conn.execute(
-                "SELECT COALESCE(SUM(realized_pnl_cents), 0) AS total FROM outcomes"
+                "SELECT COALESCE(SUM(realized_pnl_cents), 0) AS total FROM outcomes "
+                "WHERE reconciliation_note IS NULL"
             ).fetchone()
         return int(row["total"])
 
+    def annotate_outcome(self, position_id: str, note: str) -> None:
+        """Mark an outcome as not corresponding to a real broker exit.
 
-__all__ = ["REDACTED", "SECRET_KEY_MARKERS", "Journal", "redact"]
+        The row is never deleted: the competition record has to show that the
+        earlier close was journalled without a closing order behind it.
+        """
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE outcomes SET reconciliation_note = ? WHERE position_id = ?",
+                (note, position_id),
+            )
+
+    def positions_for_legs(self, long_symbol: str, short_symbol: str) -> list[dict[str, Any]]:
+        """Every journalled position over this exact pair of contracts, any state."""
+        rows = self._conn.execute(
+            "SELECT * FROM positions WHERE long_symbol = ? AND short_symbol = ? "
+            "ORDER BY opened_at",
+            (long_symbol, short_symbol),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+__all__ = [
+    "ORDER_KIND_ENTRY",
+    "ORDER_KIND_EXIT",
+    "PHANTOM_CLOSE_NOTE",
+    "POSITION_ORIGIN_ADOPTED",
+    "POSITION_ORIGIN_AGENT",
+    "REDACTED",
+    "SECRET_KEY_MARKERS",
+    "Journal",
+    "redact",
+]

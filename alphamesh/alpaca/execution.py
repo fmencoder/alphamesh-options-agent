@@ -17,9 +17,19 @@ from datetime import UTC, datetime
 from typing import Any, Protocol, runtime_checkable
 
 from alphamesh.alpaca.options import occ_underlying
-from alphamesh.alpaca.types import AccountState, BrokerPosition
+from alphamesh.alpaca.types import (
+    AccountState,
+    BrokerOrderLeg,
+    BrokerOrderSummary,
+    BrokerPosition,
+)
 from alphamesh.execution.order_builder import to_alpaca_payload
-from alphamesh.models.domain import ExecutionRecord, OrderIntent
+from alphamesh.models.domain import (
+    ExecutionRecord,
+    OrderIntent,
+    OrderSide,
+    PositionIntent,
+)
 from alphamesh.safety import check_account_number, check_trading_endpoint
 
 log = logging.getLogger(__name__)
@@ -58,6 +68,10 @@ class Broker(Protocol):
     def positions(self) -> list[BrokerPosition]: ...
 
     def working_order_symbols(self) -> frozenset[str]: ...
+
+    def recent_orders(
+        self, after: datetime | None = None, limit: int = 500
+    ) -> list[BrokerOrderSummary]: ...
 
 
 # --------------------------------------------------------------------------- #
@@ -138,8 +152,6 @@ class AlpacaPaperBroker:
         """Submit the mirror-image order that flattens the spread."""
         import httpx
 
-        from alphamesh.models.domain import OrderSide, PositionIntent
-
         flipped = []
         for leg in intent.legs:
             side = OrderSide.SELL if leg.side is OrderSide.BUY else OrderSide.BUY
@@ -218,6 +230,55 @@ class AlpacaPaperBroker:
             for p in data
         ]
 
+    def recent_orders(
+        self, after: datetime | None = None, limit: int = 500
+    ) -> list[BrokerOrderSummary]:
+        """Order history with legs, oldest first.
+
+        Adoption uses this to pair a live spread with the multi-leg entry that
+        opened it, which is the only place the real entry debit can be read.
+        """
+        params: dict[str, Any] = {
+            "status": "all",
+            "nested": "true",
+            "direction": "asc",
+            "limit": str(min(max(limit, 1), 500)),
+        }
+        if after is not None:
+            params["after"] = after.isoformat()
+        data = self._request("GET", "/v2/orders", params=params)
+        summaries: list[BrokerOrderSummary] = []
+        for order in data or []:
+            summaries.append(
+                BrokerOrderSummary(
+                    client_order_id=str(order.get("client_order_id") or ""),
+                    broker_order_id=str(order.get("id")) if order.get("id") else None,
+                    status=str(order.get("status", "")),
+                    filled_quantity=int(float(order.get("filled_qty", 0) or 0)),
+                    filled_avg_price_cents=(
+                        round(float(order["filled_avg_price"]) * 100)
+                        if order.get("filled_avg_price")
+                        else None
+                    ),
+                    submitted_at=_parse_dt(order.get("submitted_at")),
+                    legs=tuple(
+                        BrokerOrderLeg(
+                            symbol=str(leg.get("symbol") or ""),
+                            side=str(leg.get("side") or ""),
+                            position_intent=str(leg.get("position_intent") or ""),
+                            ratio=int(float(leg.get("ratio_qty", 1) or 1)),
+                            filled_avg_price=(
+                                float(leg["filled_avg_price"])
+                                if leg.get("filled_avg_price")
+                                else None
+                            ),
+                        )
+                        for leg in (order.get("legs") or [])
+                    ),
+                )
+            )
+        return summaries
+
     @staticmethod
     def _to_record(client_order_id: str, data: dict[str, Any]) -> ExecutionRecord:
         filled_price = data.get("filled_avg_price")
@@ -273,6 +334,12 @@ class SimulatedBroker:
         # OCC symbols per order, so working exposure can be reported by
         # underlying exactly as the real broker does.
         self.legs_by_client_order_id: dict[str, tuple[str, ...]] = {}
+        self.leg_details: dict[str, tuple[BrokerOrderLeg, ...]] = {}
+        self.submitted_at: dict[str, datetime] = {}
+        # Broker-side positions, settable so adoption and reconciliation can be
+        # driven against an account the journal knows nothing about.
+        self.open_positions: list[BrokerPosition] = []
+        self.close_payloads: list[dict[str, Any]] = []
 
     def account(self) -> AccountState:
         check_account_number(self._account.account_number)
@@ -288,9 +355,7 @@ class SimulatedBroker:
         if intent.client_order_id in self.orders:
             raise BrokerError(f"duplicate client_order_id {intent.client_order_id}")
         self.submitted_payloads.append(to_alpaca_payload(intent))
-        self.legs_by_client_order_id[intent.client_order_id] = tuple(
-            leg.contract.symbol for leg in intent.legs
-        )
+        self._remember_legs(intent.client_order_id, intent, closing=False)
         return self._record(intent.client_order_id, intent.quantity, intent.limit_price_cents)
 
     def close_spread(
@@ -298,11 +363,48 @@ class SimulatedBroker:
     ) -> ExecutionRecord:
         if client_order_id in self.orders:
             raise BrokerError(f"duplicate client_order_id {client_order_id}")
+        self.close_payloads.append(
+            {
+                "client_order_id": client_order_id,
+                "limit_price_cents": limit_price_cents,
+                "quantity": intent.quantity,
+                "legs": [leg.contract.symbol for leg in intent.legs],
+            }
+        )
+        self._remember_legs(client_order_id, intent, closing=True)
         return self._record(client_order_id, intent.quantity, limit_price_cents)
+
+    def _remember_legs(
+        self, client_order_id: str, intent: OrderIntent, closing: bool
+    ) -> None:
+        self.legs_by_client_order_id[client_order_id] = tuple(
+            leg.contract.symbol for leg in intent.legs
+        )
+        details: list[BrokerOrderLeg] = []
+        for leg in intent.legs:
+            side = leg.side.value
+            intent_value = leg.position_intent.value
+            if closing:
+                side = "sell" if leg.side is OrderSide.BUY else "buy"
+                intent_value = (
+                    PositionIntent.SELL_TO_CLOSE.value
+                    if side == "sell"
+                    else PositionIntent.BUY_TO_CLOSE.value
+                )
+            details.append(
+                BrokerOrderLeg(
+                    symbol=leg.contract.symbol,
+                    side=side,
+                    position_intent=intent_value,
+                    ratio=leg.ratio,
+                )
+            )
+        self.leg_details[client_order_id] = tuple(details)
 
     def _record(self, client_order_id: str, quantity: int, price_cents: int) -> ExecutionRecord:
         self._seq += 1
         now = datetime.now(UTC)
+        self.submitted_at.setdefault(client_order_id, now)
         record = ExecutionRecord(
             client_order_id=client_order_id,
             broker_order_id=f"sim-{self._seq:06d}",
@@ -337,7 +439,29 @@ class SimulatedBroker:
         return frozenset(roots)
 
     def positions(self) -> list[BrokerPosition]:
-        return []
+        return list(self.open_positions)
+
+    def recent_orders(
+        self, after: datetime | None = None, limit: int = 500
+    ) -> list[BrokerOrderSummary]:
+        summaries: list[BrokerOrderSummary] = []
+        for client_order_id, record in self.orders.items():
+            submitted = self.submitted_at.get(client_order_id, record.submitted_at)
+            if after is not None and submitted is not None and submitted < after:
+                continue
+            summaries.append(
+                BrokerOrderSummary(
+                    client_order_id=client_order_id,
+                    broker_order_id=record.broker_order_id,
+                    status=record.status,
+                    filled_quantity=record.filled_quantity,
+                    filled_avg_price_cents=record.filled_avg_price_cents,
+                    submitted_at=submitted,
+                    legs=self.leg_details.get(client_order_id, ()),
+                )
+            )
+        summaries.sort(key=lambda s: (s.submitted_at or datetime.min.replace(tzinfo=UTC)))
+        return summaries[:limit]
 
 
 __all__ = [

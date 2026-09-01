@@ -59,4 +59,44 @@ class BrokerPosition(BaseModel):
     unrealized_pl: float
 
 
-__all__ = ["AccountState", "BrokerPosition", "MarketClock"]
+class BrokerOrderLeg(BaseModel):
+    """One leg of a multi-leg order as the broker reports it."""
+
+    model_config = ConfigDict(frozen=True)
+
+    symbol: str
+    side: str = ""
+    position_intent: str = ""
+    ratio: int = 1
+    filled_avg_price: float | None = None
+
+
+class BrokerOrderSummary(BaseModel):
+    """A broker order plus its legs, used to pair positions with their entry.
+
+    Multi-leg option orders carry no symbol of their own; the OCC symbols live
+    on the legs, which is why adoption matches on the leg symbol set.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    client_order_id: str
+    broker_order_id: str | None = None
+    status: str = ""
+    filled_quantity: int = 0
+    filled_avg_price_cents: int | None = None
+    submitted_at: datetime | None = None
+    legs: tuple[BrokerOrderLeg, ...] = ()
+
+    @property
+    def leg_symbols(self) -> frozenset[str]:
+        return frozenset(leg.symbol.upper() for leg in self.legs if leg.symbol)
+
+
+__all__ = [
+    "AccountState",
+    "BrokerOrderLeg",
+    "BrokerOrderSummary",
+    "BrokerPosition",
+    "MarketClock",
+]

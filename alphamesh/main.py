@@ -128,6 +128,12 @@ class _ZeroOrderBroker:
     def get_order_by_client_id(self, client_order_id: str) -> Any:
         return self._inner.get_order_by_client_id(client_order_id)
 
+    def working_order_symbols(self) -> Any:
+        return self._inner.working_order_symbols()
+
+    def recent_orders(self, *a: Any, **k: Any) -> Any:
+        return self._inner.recent_orders(*a, **k)
+
     def submit_spread(self, *_a: Any, **_k: Any) -> Any:
         raise OrderSubmissionForbiddenError("preflight must never submit an order")
 
@@ -587,7 +593,10 @@ class _Funnel:
     risk_approved: int = 0
     orders_submitted: int = 0
     fills: int = 0
+    exit_orders: int = 0
     exits: int = 0
+    adopted: int = 0
+    ambiguous: int = 0
     open_positions: int = 0
     realized_pnl_cents: int = 0
     unrealized_pnl_cents: int = 0
@@ -602,7 +611,13 @@ class _Funnel:
         # Entry fills, not exits. Counting exits here reported FILLS=0 while
         # three spreads were filled and open.
         self.fills += report.entry_fills
+        # EXITS counts positions the broker confirmed closed. Exit orders
+        # that are merely on the wire are reported separately: a submitted
+        # close is not a closed position.
         self.exits += len(report.exits_taken)
+        self.exit_orders += len(report.exit_orders_submitted)
+        self.adopted += report.positions_adopted
+        self.ambiguous = report.ambiguous_broker_positions
         # Point-in-time, not cumulative.
         self.open_positions = report.open_positions
         self.realized_pnl_cents = report.realized_pnl_cents
@@ -613,7 +628,9 @@ class _Funnel:
             f"funnel SCANS={self.scans} QUANT_PASS={self.quant_pass} "
             f"AI_TRADABLE={self.ai_tradable} CONTRACT_SELECTED={self.contract_selected} "
             f"RISK_APPROVED={self.risk_approved} ORDERS_SUBMITTED={self.orders_submitted} "
-            f"FILLS={self.fills} EXITS={self.exits} OPEN_POSITIONS={self.open_positions} "
+            f"FILLS={self.fills} EXIT_ORDERS={self.exit_orders} EXITS={self.exits} "
+            f"ADOPTED={self.adopted} AMBIGUOUS={self.ambiguous} "
+            f"OPEN_POSITIONS={self.open_positions} "
             f"REALIZED_PNL=${self.realized_pnl_cents / 100:.2f} "
             f"UNREALIZED_PNL=${self.unrealized_pnl_cents / 100:.2f}"
         )
@@ -649,13 +666,15 @@ def cmd_run(config: AppConfig) -> int:
                     funnel.absorb(report)
                     log.info(
                         "cycle: scanned=%d quant_pass=%d ai_tradable=%d selected=%d "
-                        "risk_approved=%d orders=%d exits=%d rejections=%d errors=%d",
+                        "risk_approved=%d orders=%d exit_orders=%d exits=%d "
+                        "rejections=%d errors=%d",
                         report.symbols_scanned,
                         report.quant_passes,
                         report.ai_tradable,
                         report.contracts_selected,
                         report.risk_approved,
                         len(report.orders_submitted),
+                        len(report.exit_orders_submitted),
                         len(report.exits_taken),
                         len(report.rejections),
                         len(report.errors),

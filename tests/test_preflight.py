@@ -85,6 +85,7 @@ class TestZeroOrderBroker:
             "positions",
             "get_order_by_client_id",
             "working_order_symbols",
+            "recent_orders",
         }
         unguarded = protocol_methods - writes - reads
         assert unguarded == set(), f"unguarded broker methods: {unguarded}"

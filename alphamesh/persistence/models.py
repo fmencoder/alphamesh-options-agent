@@ -8,7 +8,16 @@ what the governor allowed, what was sent, what filled and what it earned.
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+#: Indexes over columns added after v1. A journal created by an older build
+#: still has the old table, so these cannot live in SCHEMA: the CREATE INDEX
+#: would run against a column that does not exist yet and abort startup with
+#: the production volume attached. They are applied after the columns are.
+POST_MIGRATION_INDEXES: tuple[str, ...] = (
+    "CREATE INDEX IF NOT EXISTS idx_orders_kind ON orders(kind)",
+    "CREATE INDEX IF NOT EXISTS idx_orders_position ON orders(position_id)",
+)
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -81,7 +90,9 @@ CREATE TABLE IF NOT EXISTS orders (
     filled_quantity       INTEGER NOT NULL DEFAULT 0,
     filled_avg_price_cents INTEGER,
     created_at            TEXT NOT NULL,
-    updated_at            TEXT NOT NULL
+    updated_at            TEXT NOT NULL,
+    kind                  TEXT NOT NULL DEFAULT 'ENTRY',
+    position_id           TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_orders_state ON orders(state);
 
@@ -111,7 +122,9 @@ CREATE TABLE IF NOT EXISTS positions (
     short_symbol       TEXT NOT NULL,
     state              TEXT NOT NULL,
     mfe_cents          INTEGER,
-    mae_cents          INTEGER
+    mae_cents          INTEGER,
+    origin             TEXT NOT NULL DEFAULT 'AGENT',
+    entry_basis        TEXT NOT NULL DEFAULT 'FILL'
 );
 CREATE INDEX IF NOT EXISTS idx_positions_state ON positions(state);
 
@@ -132,9 +145,10 @@ CREATE TABLE IF NOT EXISTS outcomes (
     mae_cents              INTEGER,
     exit_reason            TEXT NOT NULL,
     opened_at              TEXT NOT NULL,
-    closed_at              TEXT NOT NULL
+    closed_at              TEXT NOT NULL,
+    reconciliation_note    TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_outcomes_closed ON outcomes(closed_at);
 """
 
-__all__ = ["SCHEMA", "SCHEMA_VERSION"]
+__all__ = ["POST_MIGRATION_INDEXES", "SCHEMA", "SCHEMA_VERSION"]
