@@ -414,6 +414,8 @@ exits 78 with the exact fix rather than failing obscurely mid-cycle.
 | `ALPHAMESH_DRY_RUN` | `false` | **Critical** — see below |
 | `ALPHAMESH_LOOP_SECONDS` | `60` | Cycle interval while open |
 | `ALPHAMESH_CLOSED_POLL_SECONDS` | `300` | Backoff while closed |
+| `ALPHAMESH_ENTRY_ORDER_TTL_SECONDS` | `180` | Age at which an unfilled *entry* is abandoned |
+| `ALPHAMESH_EXIT_ORDER_TTL_SECONDS` | `120` | Age at which an unfilled *exit* is re-quoted |
 
 **`ALPHAMESH_DRY_RUN` defaults to `true`.** Left unset, the agent runs the
 in-process simulator: no order reaches Alpaca and any P&L in the journal is

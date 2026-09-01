@@ -217,13 +217,87 @@ end-of-day flatten, max holding time, then mark-based profit target and stop,
 then regime invalidation. A position that cannot be marked does **not** trigger
 a price exit — a missing mark is not a zero value.
 
+**Exit execution** is a broker round trip, not a journal write. `exits.py`
+decides *whether* to close; the orchestrator then builds the mirror-image order
+and sends it through `Broker.close_spread`, which flips both legs to
+`SELL_TO_CLOSE` / `BUY_TO_CLOSE`. The lifecycle is:
+
+```
+MONITORING -> EXIT_REQUESTED -> closing order submitted -> broker confirms fill
+           -> position CLOSED, realised P&L booked from that fill
+```
+
+Only the last hop retires a position. Four properties this holds:
+
+- **A submitted close is not a close.** An order on the wire leaves the position
+  in `EXIT_REQUESTED`; it is still real exposure and still marked and managed.
+- **Realised P&L only ever comes from fills.** Entry fill against exit fill. A
+  *mark* is never realised money — booking one was the defect that let nine live
+  spreads look closed while the account still held them.
+- **A partial fill never closes.** The unfilled balance is exposure, so the
+  position stays open and the order is left alone; the sweep below skips it.
+- **Closing is never gated on risk headroom.** The exit path does not consult
+  the governor at all, so no cap can refuse a risk-reducing close. An over-cap
+  portfolio blocks new exposure and lets exposure fall through exits.
+
+Exits are only ever sent into an open session. Recovery and adoption run
+overnight, but discovering that a position should be closed is not a licence to
+queue an order against a dead book: the next open re-prices it against live
+quotes. An unfilled close is retired after `ALPHAMESH_EXIT_ORDER_TTL_SECONDS`
+(default 120), confirmed dead with the broker, and re-quoted next cycle — an
+exit that never fills is the same failure as never sending one. The entry TTL
+sweep and the exit sweep are kept apart by the `kind` column on `orders`;
+cancelling a close because it looked like a stale entry would leave the position
+open with nothing managing it.
+
+**Adoption** (`adoption.py`) closes the gap in the other direction. A spread the
+broker holds and the journal has forgotten — after a restart, a lost write, or
+a bad close — is unmanaged risk *and* permanently blocks its underlying at the
+broker-truth entry guard. Every cycle, before any risk number is computed, raw
+option legs are grouped by (underlying, expiration, type) and resolved into
+verticals: exactly one long against one short, equal size, strikes forming a
+supported debit spread. The entry debit comes from the originating multi-leg
+order where it can be found, otherwise from the per-leg cost basis; a spread
+whose basis cannot be established is not adopted.
+
+Ambiguity fails closed. A leg set that is not unmistakably one of the two
+supported verticals — an odd leg, mismatched sizes, a credit structure — is
+reported, never guessed at: a wrong pairing would produce a "closing" order that
+flattens one leg and leaves the other naked. While any such position exists,
+`PortfolioState.exposure_fully_accounted` is false and the governor refuses new
+exposure, because the aggregate caps would be measured against an understated
+portfolio. Exits are unaffected.
+
+Adoption never submits anything, so it is safe outside market hours.
+
 ### 9. Persistence (`persistence/`)
 
-Six tables linked by `decision_id`: `events`, `decisions`, `risk_decisions`,
+Seven tables linked by `decision_id`: `events`, `decisions`, `risk_decisions`,
 `orders`, `state_transitions`, `positions`, `outcomes`. Together they
 reconstruct: what the agent observed, what it computed, the regime, the bull and
 bear arguments, the judge verdict, the contracts chosen, the governor's verdict
 and every check it ran, the order, the fills, the exit and the P&L.
+
+Schema v2 adds `orders.kind` / `orders.position_id` (which separates a
+closing order from an entry), `positions.origin` / `positions.entry_basis`
+(whether a position was opened by the agent or adopted from the broker, and
+where its cost basis came from), and `outcomes.reconciliation_note`.
+
+A journal written by an older build already exists on the production volume,
+so these are applied by `ALTER TABLE` at open, additively — no row is dropped
+or rewritten, and indexes over the new columns are created only after the
+columns are, since an index on a column that does not exist yet would abort
+startup with the real volume attached.
+
+`reconciliation_note` is how a phantom close is preserved rather than erased.
+When adoption finds a live broker spread whose journal position reads CLOSED
+with no filled closing order behind it, the outcome row is annotated
+`PHANTOM_NO_BROKER_EXIT_ORDER` and a `phantom_close_reconciled` event is
+written. The row stays exactly as it was — the competition record has to show
+what actually happened — but annotated outcomes are excluded from every
+realised-P&L total, because that money was never earned. A close backed by a
+real filled exit order is never annotated, even if the same two contracts are
+later traded again.
 
 `redact()` recurses through every payload and blanks any key whose *name*
 matches a credential marker by substring — so `apca_api_secret_key` is caught by
