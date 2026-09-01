@@ -58,6 +58,10 @@ class Settings(BaseModel):
     # the per-symbol duplicate lock, so a limit that the market has walked away
     # from silently blocks that symbol for the rest of the session.
     entry_order_ttl_seconds: int = 180
+    # Age at which an unfilled closing order is re-priced against the current
+    # chain. An exit that never fills leaves real exposure unmanaged, so a
+    # stale exit limit is retired and re-quoted rather than left to sit.
+    exit_order_ttl_seconds: int = 120
     dry_run: bool = True
     log_level: str = "INFO"
     data_source: str = "rest"
@@ -90,6 +94,7 @@ class Settings(BaseModel):
             "loop_seconds": self.loop_seconds,
             "closed_poll_seconds": self.closed_poll_seconds,
             "entry_order_ttl_seconds": self.entry_order_ttl_seconds,
+            "exit_order_ttl_seconds": self.exit_order_ttl_seconds,
         }
 
 
@@ -109,6 +114,7 @@ def load_settings() -> Settings:
         loop_seconds=_env_int("ALPHAMESH_LOOP_SECONDS", 30),
         closed_poll_seconds=_env_int("ALPHAMESH_CLOSED_POLL_SECONDS", 300),
         entry_order_ttl_seconds=_env_int("ALPHAMESH_ENTRY_ORDER_TTL_SECONDS", 180),
+        exit_order_ttl_seconds=_env_int("ALPHAMESH_EXIT_ORDER_TTL_SECONDS", 120),
         dry_run=_env_bool("ALPHAMESH_DRY_RUN", True),
         log_level=_env("ALPHAMESH_LOG_LEVEL") or "INFO",
         data_source=(_env("ALPHAMESH_DATA_SOURCE") or "rest").lower(),

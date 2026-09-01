@@ -12,8 +12,13 @@ import hashlib
 from datetime import datetime
 
 from alphamesh.models.domain import (
+    OptionContractCandidate,
     OrderIntent,
+    OrderSide,
+    PositionIntent,
+    PositionRecord,
     RiskDecision,
+    SpreadLeg,
     SpreadStructure,
     Strategy,
     TradeDecision,
@@ -85,6 +90,93 @@ def build_order_intent(
     )
 
 
+EXIT_ID_INFIX = "X"
+"""Marks a closing order id, so an exit is never mistaken for an entry."""
+
+
+def build_exit_client_order_id(
+    position: PositionRecord, limit_cents: int, attempt: int = 0
+) -> str:
+    """Deterministic id for the order that closes one position.
+
+    Derived from the position, the price being quoted and the attempt number,
+    so a restart between reserving the id and sending the order finds the same
+    id and reconciles it instead of flattening the spread twice.
+
+    ``attempt`` is the count of closing orders already raised for this position,
+    read back from the journal. It only advances once a previous attempt is
+    confirmed dead, which is what lets a close be re-quoted: an id is never
+    reused, and a still-live attempt never mints a second one.
+    """
+    payload = "|".join(
+        [
+            position.position_id,
+            position.long_symbol,
+            position.short_symbol,
+            str(position.quantity),
+            str(limit_cents),
+            f"exit{attempt}",
+        ]
+    )
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+    code = STRATEGY_CODES.get(position.strategy, "UNK")
+    candidate = (
+        f"{CLIENT_ORDER_ID_PREFIX}-{position.symbol.upper()}-{code}{EXIT_ID_INFIX}-{digest}"
+    )
+    return candidate[:MAX_CLIENT_ORDER_ID_LEN]
+
+
+def build_exit_intent(
+    position: PositionRecord,
+    long_contract: OptionContractCandidate,
+    short_contract: OptionContractCandidate,
+    limit_price_cents: int,
+    now: datetime,
+    client_order_id: str | None = None,
+    attempt: int = 0,
+) -> OrderIntent:
+    """Assemble the order that flattens an open spread.
+
+    The legs are carried in their *opening* orientation. ``Broker.close_spread``
+    mirrors them into SELL_TO_CLOSE / BUY_TO_CLOSE, so the closing intents are
+    produced in exactly one place rather than being spelled out twice.
+    """
+    if limit_price_cents <= 0:
+        raise ValueError("an exit limit price must be positive")
+    if long_contract.symbol != position.long_symbol:
+        raise ValueError("long contract does not match the position")
+    if short_contract.symbol != position.short_symbol:
+        raise ValueError("short contract does not match the position")
+
+    return OrderIntent(
+        client_order_id=(
+            client_order_id
+            or build_exit_client_order_id(position, limit_price_cents, attempt)
+        ),
+        decision_id=position.decision_id,
+        symbol=position.symbol,
+        strategy=position.strategy,
+        quantity=position.quantity,
+        limit_price_cents=limit_price_cents,
+        legs=(
+            SpreadLeg(
+                contract=long_contract,
+                side=OrderSide.BUY,
+                ratio=1,
+                position_intent=PositionIntent.BUY_TO_OPEN,
+            ),
+            SpreadLeg(
+                contract=short_contract,
+                side=OrderSide.SELL,
+                ratio=1,
+                position_intent=PositionIntent.SELL_TO_OPEN,
+            ),
+        ),
+        max_loss_cents=max(position.max_loss_cents, 1),
+        created_at=now,
+    )
+
+
 def to_alpaca_payload(intent: OrderIntent) -> dict[str, object]:
     """Render the intent as an Alpaca multi-leg (``mleg``) options order.
 
@@ -112,9 +204,12 @@ def to_alpaca_payload(intent: OrderIntent) -> dict[str, object]:
 
 __all__ = [
     "CLIENT_ORDER_ID_PREFIX",
+    "EXIT_ID_INFIX",
     "MAX_CLIENT_ORDER_ID_LEN",
     "STRATEGY_CODES",
     "build_client_order_id",
+    "build_exit_client_order_id",
+    "build_exit_intent",
     "build_order_intent",
     "signal_hash",
     "to_alpaca_payload",

@@ -26,14 +26,19 @@ from alphamesh.alpaca.execution import AmbiguousSubmissionError, BrokerError
 from alphamesh.alpaca.options import occ_underlying
 from alphamesh.alpaca.types import MarketClock
 from alphamesh.config import AppConfig
+from alphamesh.execution.adoption import (
+    AdoptedSpread,
+    AdoptionSummary,
+    reconstruct_spreads,
+)
 from alphamesh.execution.exits import evaluate_exit
 from alphamesh.execution.monitor import (
+    DEAD_STATUSES,
     OrderMonitor,
-    PositionMark,
     mark_position,
     mark_spread_cents,
 )
-from alphamesh.execution.order_builder import build_order_intent
+from alphamesh.execution.order_builder import build_exit_intent, build_order_intent
 from alphamesh.execution.recovery import reconcile_open_orders
 from alphamesh.execution.state_machine import is_terminal, transition
 from alphamesh.intelligence.reasoning import ReasoningProvider
@@ -54,7 +59,13 @@ from alphamesh.models.domain import (
     TradeOutcome,
     TradeState,
 )
-from alphamesh.persistence.journal import Journal
+from alphamesh.persistence.journal import (
+    ORDER_KIND_ENTRY,
+    ORDER_KIND_EXIT,
+    PHANTOM_CLOSE_NOTE,
+    POSITION_ORIGIN_ADOPTED,
+    Journal,
+)
 from alphamesh.risk.circuit_breaker import evaluate_circuit_breaker
 from alphamesh.risk.governor import RiskGovernor
 from alphamesh.risk.portfolio import PortfolioState
@@ -103,6 +114,14 @@ class CycleReport:
     open_positions: int = 0
     realized_pnl_cents: int = 0
     unrealized_pnl_cents: int = 0
+    # Exits. ``exit_orders_submitted`` is what reached the broker;
+    # ``exits_taken`` is only what the broker confirmed as closed. They are
+    # deliberately separate: a submitted exit is not a closed position, and
+    # conflating them is what let phantom closes look like real ones.
+    exit_orders_submitted: list[str] = field(default_factory=list)
+    exit_orders_repriced: int = 0
+    positions_adopted: int = 0
+    ambiguous_broker_positions: int = 0
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -136,6 +155,10 @@ class CycleReport:
             "open_positions": self.open_positions,
             "realized_pnl_cents": self.realized_pnl_cents,
             "unrealized_pnl_cents": self.unrealized_pnl_cents,
+            "exit_orders_submitted": list(self.exit_orders_submitted),
+            "exit_orders_repriced": self.exit_orders_repriced,
+            "positions_adopted": self.positions_adopted,
+            "ambiguous_broker_positions": self.ambiguous_broker_positions,
         }
 
 
@@ -157,6 +180,10 @@ class Orchestrator:
         self.monitor = OrderMonitor(stack.broker, journal)
         self._regimes: dict[str, RegimeAssessment] = {}
         self._clock: MarketClock | None = None
+        # Underlyings the broker holds that could not be resolved into a
+        # managed spread. Exposure is real but uncounted, so new risk is
+        # refused until it is understood.
+        self._ambiguous_broker_symbols: frozenset[str] = frozenset()
 
     # ------------------------------------------------------------- lifecycle
     def startup(self) -> dict[str, object]:
@@ -169,7 +196,168 @@ class Orchestrator:
             report.reconciled,
             report.orphaned,
         )
-        return report.as_dict()
+        adoption = self.adopt_broker_positions()
+        summary = report.as_dict()
+        summary["adoption"] = adoption.as_dict()
+        return summary
+
+    # ------------------------------------------------------------ adoption
+    def adopt_broker_positions(self, now: datetime | None = None) -> AdoptionSummary:
+        """Take ownership of live broker spreads the journal has forgotten.
+
+        This only reads and journals. It never submits an order, so it is safe
+        to run outside market hours -- discovery is not execution, and an
+        adopted position is exited by the normal management path against live
+        quotes, not by a queued order waiting for the bell.
+        """
+        now = now or datetime.now(UTC)
+        try:
+            positions = self.stack.broker.positions()
+        except Exception as exc:
+            log.warning("adoption could not read broker positions: %s", exc)
+            return AdoptionSummary(error=str(exc))
+
+        try:
+            orders = self.stack.broker.recent_orders()
+        except Exception as exc:
+            # Without order history the entry debit can still come from the
+            # per-leg cost basis, so this degrades rather than fails.
+            log.warning("adoption could not read broker order history: %s", exc)
+            orders = []
+
+        result = reconstruct_spreads(positions, orders)
+        known = {
+            (p.long_symbol, p.short_symbol) for p in self.journal.open_positions()
+        }
+        adopted: list[str] = []
+
+        for spread in result.spreads:
+            if (spread.long_symbol, spread.short_symbol) in known:
+                continue
+            position = self._adopt_one(spread, now)
+            adopted.append(position.position_id)
+
+        self._ambiguous_broker_symbols = result.ambiguous_symbols
+        for item in result.ambiguous:
+            log.warning(
+                "broker_position_ambiguous symbol=%s reason=%s legs=%s; "
+                "not adopted, and new exposure stays blocked",
+                item.symbol,
+                item.reason,
+                list(item.legs),
+            )
+
+        summary = AdoptionSummary(
+            adopted=len(adopted),
+            ambiguous=len(result.ambiguous),
+            detail=result.as_dict(),
+        )
+        if adopted or result.ambiguous:
+            self.journal.record_event("broker_position_adoption", summary.as_dict())
+            log.info(
+                "adoption: adopted=%d ambiguous=%d broker_option_legs=%d",
+                len(adopted),
+                len(result.ambiguous),
+                len(positions),
+            )
+        return summary
+
+    def _adopt_one(self, spread: AdoptedSpread, now: datetime) -> PositionRecord:
+        """Journal one reconstructed spread, annotating any phantom close."""
+        position = PositionRecord(
+            position_id=uuid.uuid4().hex[:16],
+            decision_id=f"adopted-{uuid.uuid4().hex[:12]}",
+            client_order_id=spread.client_order_id or f"adopted-{uuid.uuid4().hex[:12]}",
+            symbol=spread.symbol,
+            strategy=spread.strategy,
+            quantity=spread.quantity,
+            entry_debit_cents=spread.entry_debit_cents,
+            max_loss_cents=spread.max_loss_cents,
+            max_profit_cents=spread.max_profit_cents,
+            # An unknown open time must not fabricate a holding period. Falling
+            # back to now means the max-holding-time rule starts from adoption,
+            # which delays a time exit rather than forcing one on bad data.
+            opened_at=spread.opened_at or now,
+            expiration=spread.expiration,
+            long_symbol=spread.long_symbol,
+            short_symbol=spread.short_symbol,
+            state=TradeState.MONITORING,
+        )
+        self.journal.record_position(
+            position, origin=POSITION_ORIGIN_ADOPTED, entry_basis=spread.entry_basis
+        )
+        self._annotate_phantom_closes(spread, position)
+        log.info(
+            "position_adopted position_id=%s symbol=%s strategy=%s qty=%d "
+            "long=%s short=%s entry_debit_cents=%d basis=%s expiration=%s",
+            position.position_id,
+            position.symbol,
+            position.strategy.value,
+            position.quantity,
+            position.long_symbol,
+            position.short_symbol,
+            position.entry_debit_cents,
+            spread.entry_basis,
+            position.expiration.isoformat(),
+        )
+        return position
+
+    def _had_real_closing_order(self, position_id: str) -> bool:
+        """Whether a filled closing order stands behind this position's close.
+
+        This is the whole distinction between a phantom close and a real one:
+        a real close has an exit order that the broker filled. A phantom has
+        nothing but a journal row.
+        """
+        exit_order = self.journal.exit_order_for(position_id)
+        if exit_order is None:
+            return False
+        return int(exit_order.get("filled_quantity") or 0) > 0
+
+    def _annotate_phantom_closes(
+        self, spread: AdoptedSpread, adopted: PositionRecord
+    ) -> None:
+        """Record that an earlier journal close had no broker order behind it.
+
+        Nothing is deleted. The outcome row stays exactly as it was written and
+        gains a note, which both preserves the competition audit trail and takes
+        its invented money out of every realised total.
+        """
+        for row in self.journal.positions_for_legs(
+            spread.long_symbol, spread.short_symbol
+        ):
+            if str(row["position_id"]) == adopted.position_id:
+                continue
+            if TradeState(str(row["state"])) is not TradeState.CLOSED:
+                continue
+            position_id = str(row["position_id"])
+            if self._had_real_closing_order(position_id):
+                # A genuine close that was later re-opened over the same two
+                # contracts. Its money was real; annotating it would erase a
+                # true result to tidy up a false one.
+                continue
+            self.journal.annotate_outcome(position_id, PHANTOM_CLOSE_NOTE)
+            log.warning(
+                "phantom_close_reconciled symbol=%s journal_position_id=%s "
+                "adopted_position_id=%s broker_position_present=true "
+                "reason=no_broker_exit_order",
+                spread.symbol,
+                position_id,
+                adopted.position_id,
+            )
+            self.journal.record_event(
+                "phantom_close_reconciled",
+                {
+                    "symbol": spread.symbol,
+                    "journal_position_id": position_id,
+                    "adopted_position_id": adopted.position_id,
+                    "broker_position_present": True,
+                    "reason": "no_broker_exit_order",
+                    "long_symbol": spread.long_symbol,
+                    "short_symbol": spread.short_symbol,
+                },
+                symbol=spread.symbol,
+            )
 
     def market_clock(self) -> MarketClock | None:
         """Read the trading calendar. ``None`` means it could not be read, which
@@ -228,6 +416,7 @@ class Orchestrator:
             broker_position_symbols=broker_positions,
             broker_working_symbols=broker_working,
             broker_truth_available=broker_ok,
+            unaccounted_broker_symbols=self._ambiguous_broker_symbols,
         )
 
     def _broker_exposure(self) -> tuple[frozenset[str], frozenset[str], bool]:
@@ -325,6 +514,15 @@ class Orchestrator:
             )
             return report
 
+        # 1. Take ownership of anything the broker holds that the journal has
+        #    forgotten, before any risk number is computed from it. This runs
+        #    first on purpose: an unadopted spread is exposure that nothing
+        #    manages and no total counts, so a portfolio read taken ahead of it
+        #    would understate real risk.
+        adoption = self.adopt_broker_positions(now)
+        report.positions_adopted = adoption.adopted
+        report.ambiguous_broker_positions = adoption.ambiguous
+
         try:
             portfolio = self.portfolio_state(now)
         except Exception as exc:
@@ -342,9 +540,11 @@ class Orchestrator:
         if breaker.tripped:
             self.journal.record_event("circuit_breaker", {"detail": breaker.detail})
 
-        # 1. Retire entry orders the market has walked away from, before
+        # 2. Retire entry orders the market has walked away from, before
         #    anything else reads portfolio state -- a stale working order holds
-        #    the per-symbol duplicate lock.
+        #    the per-symbol duplicate lock. Exit orders are swept separately and
+        #    on their own clock: an unfilled close is re-quoted, never abandoned.
+        self._expire_stale_exit_orders(now, report)
         self._expire_stale_entry_orders(now, report)
         if report.stale_orders_cancelled:
             try:
@@ -354,10 +554,19 @@ class Orchestrator:
                 report.errors.append(f"portfolio_state: {exc}")
                 return report
 
-        # 2. Manage what is already open, before considering anything new.
+        # 3. Manage what is already open, before considering anything new.
         self._manage_positions(portfolio, now, breaker.tripped, report)
+        if report.exits_taken or report.exit_orders_submitted:
+            # A close changes exposure, so limits must be recomputed before
+            # any new candidate is sized against them.
+            try:
+                portfolio = self.portfolio_state(now)
+            except Exception as exc:  # pragma: no cover - defensive
+                log.exception("could not re-read portfolio after exits")
+                report.errors.append(f"portfolio_state: {exc}")
+                return report
 
-        # 3. Scan and decide.
+        # 4. Scan and decide.
         scanned = self.scout.scan()
         report.symbols_scanned = len(scanned)
 
@@ -427,7 +636,7 @@ class Orchestrator:
         if ttl <= 0:
             return
 
-        for row in self.journal.open_orders():
+        for row in self.journal.open_orders(kind=ORDER_KIND_ENTRY):
             try:
                 state = TradeState(str(row["state"]))
             except ValueError:
@@ -783,7 +992,11 @@ class Orchestrator:
         # Reuse the clock already read by run_cycle's market-hours gate.
         clock = self._clock
 
-        for position in portfolio.open_positions:
+        # Settle anything already on the wire first: a position with a live
+        # closing order must not be re-evaluated into a second one.
+        self._reconcile_exit_orders(now, report)
+
+        for position in self.journal.open_positions():
             mark = self._mark_for(position, now)
             if mark is not None:
                 previous_mfe, previous_mae = self.journal.position_excursions(
@@ -792,6 +1005,12 @@ class Orchestrator:
                 mfe = max(previous_mfe or 0, mark.unrealized_pnl_cents)
                 mae = min(previous_mae or 0, mark.unrealized_pnl_cents)
                 self.journal.update_excursions(position.position_id, mfe, mae)
+
+            existing = self.journal.exit_order_for(position.position_id)
+            if existing is not None and not is_terminal(TradeState(str(existing["state"]))):
+                # Already exiting. Re-pricing is handled by the exit TTL sweep,
+                # which cancels and confirms before anything new is raised.
+                continue
 
             decision = evaluate_exit(
                 position,
@@ -806,31 +1025,306 @@ class Orchestrator:
                 continue
 
             try:
-                self._exit_position(position, mark, decision.reason, decision.detail, now)
-                report.exits_taken.append(f"{position.symbol}:{decision.reason}")
+                self._request_exit(position, decision.reason, decision.detail, now, report)
             except Exception as exc:
-                log.exception("exit failed for %s", position.position_id)
+                log.exception("exit request failed for %s", position.position_id)
                 report.errors.append(f"exit {position.position_id}: {exc}")
 
-    def _exit_position(
+    # --------------------------------------------------------------- exits
+    def _request_exit(
         self,
         position: PositionRecord,
-        mark: PositionMark | None,
         reason: ExitReason | None,
         detail: str,
         now: datetime,
+        report: CycleReport,
     ) -> None:
-        exit_value = mark.mark_cents if mark is not None else 0
+        """Send the order that actually flattens the spread.
+
+        Nothing here closes the position in the journal. A closing order is a
+        request, not an outcome: only a broker-confirmed fill, reconciled by
+        :meth:`_reconcile_exit_orders`, may retire a position or realise money.
+        """
+        if not self._market_is_open():
+            # Recovery and management run outside the session too. Discovering
+            # that a position should be exited is not a licence to queue an
+            # order against a dead book; the next open re-evaluates it against
+            # live quotes.
+            log.info(
+                "exit_deferred_market_closed position_id=%s symbol=%s reason=%s",
+                position.position_id,
+                position.symbol,
+                reason,
+            )
+            return
+
+        contracts = self._contracts_for(position, now)
+        long_c = contracts.get(position.long_symbol)
+        short_c = contracts.get(position.short_symbol)
+        if long_c is None or short_c is None:
+            self._log_unresolved_exit(position, reason, "legs not present in the chain", now)
+            return
+
+        spread_mark = mark_spread_cents(long_c, short_c)
+        if spread_mark is None:
+            self._log_unresolved_exit(position, reason, "no usable quote on both legs", now)
+            return
+
+        # Selling the spread back: the limit is what we ask to receive. A
+        # spread marked at or below zero is still worth closing, so the order
+        # is quoted at the minimum tick rather than abandoned.
+        limit_cents = max(1, spread_mark)
+        intent = build_exit_intent(
+            position,
+            long_c,
+            short_c,
+            limit_cents,
+            now,
+            attempt=self.journal.exit_order_count(position.position_id),
+        )
+
+        # Reserve before the wire, exactly as an entry does, so a crash between
+        # here and the broker leaves a row for recovery instead of a spread that
+        # gets flattened twice.
+        if not self.journal.reserve_order(
+            intent, kind=ORDER_KIND_EXIT, position_id=position.position_id
+        ):
+            log.info(
+                "exit_order_already_reserved client_order_id=%s position_id=%s",
+                intent.client_order_id,
+                position.position_id,
+            )
+            return
+
+        self.journal.set_position_state(position.position_id, TradeState.EXIT_REQUESTED)
+
+        try:
+            self._assert_paper_before_submit()
+        except LiveTradingForbiddenError as exc:
+            self.journal.set_order_state(
+                intent.client_order_id,
+                TradeState.REJECTED,
+                f"paper recheck failed: {exc.detail}",
+            )
+            self.journal.set_position_state(position.position_id, TradeState.MONITORING)
+            report.errors.append(f"exit {position.symbol}: {exc.detail}")
+            return
+
+        try:
+            record = self.stack.broker.close_spread(
+                intent, limit_cents, intent.client_order_id
+            )
+        except AmbiguousSubmissionError as exc:
+            # The close may already be live. Never send a second one; the
+            # reservation stays for reconciliation to resolve.
+            log.error("ambiguous exit submission for %s: %s", intent.client_order_id, exc)
+            self.journal.record_event(
+                "ambiguous_exit_submission",
+                {"client_order_id": intent.client_order_id, "cause": exc.cause},
+                decision_id=position.decision_id,
+                symbol=position.symbol,
+            )
+            report.errors.append(f"{position.symbol}: ambiguous exit, will reconcile")
+            return
+        except BrokerError as exc:
+            self.journal.set_order_state(
+                intent.client_order_id, TradeState.REJECTED, f"broker rejected: {exc}"
+            )
+            self.journal.set_position_state(position.position_id, TradeState.MONITORING)
+            report.errors.append(f"exit {position.symbol}: broker rejected ({exc})")
+            return
+
+        self.journal.set_order_state(
+            intent.client_order_id, TradeState.SUBMITTED, f"exit requested: {reason}"
+        )
+        self.journal.update_order_execution(record, TradeState.SUBMITTED)
+        report.exit_orders_submitted.append(intent.client_order_id)
+        log.info(
+            "exit_order_submitted client_order_id=%s position_id=%s symbol=%s "
+            "reason=%s limit_cents=%d qty=%d",
+            intent.client_order_id,
+            position.position_id,
+            position.symbol,
+            reason,
+            limit_cents,
+            position.quantity,
+        )
+        self.journal.record_event(
+            "exit_order_submitted",
+            {
+                "position_id": position.position_id,
+                "client_order_id": intent.client_order_id,
+                "exit_reason": str(reason),
+                "limit_price_cents": limit_cents,
+                "detail": detail,
+            },
+            decision_id=position.decision_id,
+            symbol=position.symbol,
+        )
+
+        # A close can fill immediately. Settle it now rather than waiting a
+        # cycle, but through the same confirmation path as everything else.
+        self._reconcile_exit_orders(now, report)
+
+    def _log_unresolved_exit(
+        self,
+        position: PositionRecord,
+        reason: ExitReason | None,
+        why: str,
+        now: datetime,
+    ) -> None:
+        """An exit that is due but cannot be priced. Never silent.
+
+        An expiring position that cannot be closed is the loudest case: it will
+        settle on its own terms rather than ours, so it is logged at warning and
+        journalled rather than skipped.
+        """
+        expiring = position.expiration <= now.date()
+        (log.warning if expiring else log.info)(
+            "exit_unresolved position_id=%s symbol=%s reason=%s expiration=%s "
+            "expiring=%s why=%s",
+            position.position_id,
+            position.symbol,
+            reason,
+            position.expiration.isoformat(),
+            expiring,
+            why,
+        )
+        self.journal.record_event(
+            "exit_unresolved",
+            {
+                "position_id": position.position_id,
+                "exit_reason": str(reason),
+                "expiration": position.expiration.isoformat(),
+                "expiring": expiring,
+                "why": why,
+            },
+            decision_id=position.decision_id,
+            symbol=position.symbol,
+        )
+
+    def _reconcile_exit_orders(self, now: datetime, report: CycleReport) -> None:
+        """Resolve closing orders against the broker, and only then close.
+
+        Four outcomes, and only the first retires a position:
+
+        * fully filled -- realise from the actual fill and close;
+        * partially filled -- real exposure is still open, so the position stays
+          open and the order is left alone;
+        * dead (cancelled, rejected, expired) -- the position returns to
+          management and may be re-quoted next cycle;
+        * still working -- nothing to do.
+        """
+        for row in self.journal.open_orders(kind=ORDER_KIND_EXIT):
+            client_order_id = str(row["client_order_id"])
+            position_id = str(row["position_id"] or "")
+            position = self.journal.get_position(position_id) if position_id else None
+            if position is None:
+                continue
+
+            try:
+                record = self.monitor.refresh(client_order_id)
+            except Exception as exc:
+                log.warning("could not refresh exit %s: %s", client_order_id, exc)
+                continue
+
+            if record is None:
+                # The broker has never heard of it. For a reservation that never
+                # reached the wire -- an ambiguous submission, a crash between
+                # reserving and sending -- that is conclusive: retire it and
+                # give the position back to management, or it stays in
+                # EXIT_REQUESTED forever with nothing able to raise a new close.
+                # For an order we know was submitted, a lookup returning nothing
+                # is ambiguous, not proof, so it is left alone.
+                if TradeState(str(row["state"])) is TradeState.CONSTRUCTED:
+                    self.journal.set_order_state(
+                        client_order_id,
+                        TradeState.FAILED,
+                        "exit reserved but never reached the broker; retired",
+                    )
+                    self.journal.set_position_state(
+                        position.position_id, TradeState.MONITORING
+                    )
+                    log.info(
+                        "exit_reservation_retired client_order_id=%s position_id=%s; "
+                        "position returned to management",
+                        client_order_id,
+                        position.position_id,
+                    )
+                continue
+
+            status = record.status.lower()
+            if status in DEAD_STATUSES:
+                self.journal.set_position_state(position.position_id, TradeState.MONITORING)
+                log.info(
+                    "exit_order_dead client_order_id=%s position_id=%s status=%s; "
+                    "position returned to management",
+                    client_order_id,
+                    position.position_id,
+                    record.status,
+                )
+                continue
+
+            if record.filled_quantity <= 0:
+                continue
+
+            if record.filled_quantity < position.quantity:
+                # Never close on a partial. The remaining spreads are still real
+                # exposure and the order is still working against them.
+                log.info(
+                    "exit_partially_filled client_order_id=%s position_id=%s "
+                    "filled=%d of %d; position stays open",
+                    client_order_id,
+                    position.position_id,
+                    record.filled_quantity,
+                    position.quantity,
+                )
+                self.journal.record_event(
+                    "exit_partially_filled",
+                    {
+                        "position_id": position.position_id,
+                        "client_order_id": client_order_id,
+                        "filled_quantity": record.filled_quantity,
+                        "position_quantity": position.quantity,
+                    },
+                    symbol=position.symbol,
+                )
+                continue
+
+            if record.filled_avg_price_cents is None:
+                # Filled but unpriced: realised money cannot be established yet,
+                # and inventing it is exactly the defect this replaced.
+                log.warning(
+                    "exit_filled_without_price client_order_id=%s position_id=%s; "
+                    "leaving unresolved rather than inventing a realised value",
+                    client_order_id,
+                    position.position_id,
+                )
+                continue
+
+            self._finalise_exit(position, record, client_order_id, now, report)
+
+    def _finalise_exit(
+        self,
+        position: PositionRecord,
+        record: ExecutionRecord,
+        client_order_id: str,
+        now: datetime,
+        report: CycleReport,
+    ) -> None:
+        """Close one position from its actual closing fill.
+
+        Realised money is entry fill against exit fill. No mark, no estimate,
+        no fallback: both sides are prices the broker actually traded.
+        """
+        exit_price_cents = record.filled_avg_price_cents or 0
+        exit_value = exit_price_cents * OPTION_MULTIPLIER * record.filled_quantity
         realized = exit_value - position.entry_debit_cents
         holding = (now - position.opened_at).total_seconds() / 60.0
         mfe, mae = self.journal.position_excursions(position.position_id)
         assessment = self._regimes.get(position.symbol)
         regime = assessment.regime if assessment is not None else Regime.UNKNOWN
-
-        self.journal.set_order_state(
-            position.client_order_id, TradeState.EXIT_REQUESTED, detail
-        )
-        self.journal.set_position_state(position.position_id, TradeState.EXIT_REQUESTED)
+        reason = self._exit_reason_for(client_order_id)
 
         outcome = TradeOutcome(
             position_id=position.position_id,
@@ -839,7 +1333,7 @@ class Orchestrator:
             strategy=position.strategy,
             regime=regime,
             confidence=0.0,
-            quantity=position.quantity,
+            quantity=record.filled_quantity,
             entry_debit_cents=position.entry_debit_cents,
             exit_value_cents=exit_value,
             realized_pnl_cents=realized,
@@ -849,25 +1343,125 @@ class Orchestrator:
             holding_minutes=holding,
             max_favorable_excursion_cents=mfe,
             max_adverse_excursion_cents=mae,
-            exit_reason=reason or ExitReason.MANUAL,
+            exit_reason=reason,
             opened_at=position.opened_at,
             closed_at=now,
         )
         self.journal.record_outcome(outcome)
         self.journal.set_order_state(
-            position.client_order_id, TradeState.CLOSED, f"exit: {reason}"
+            client_order_id, TradeState.CLOSED, f"exit filled: {reason}"
+        )
+        report.exits_taken.append(f"{position.symbol}:{reason}")
+        log.info(
+            "position_closed position_id=%s symbol=%s exit_fill_cents=%d "
+            "entry_debit_cents=%d realized_cents=%d reason=%s",
+            position.position_id,
+            position.symbol,
+            exit_price_cents,
+            position.entry_debit_cents,
+            realized,
+            reason,
         )
         self.journal.record_event(
             "position_closed",
             {
                 "position_id": position.position_id,
+                "client_order_id": client_order_id,
                 "exit_reason": str(reason),
+                "exit_fill_price_cents": exit_price_cents,
+                "exit_value_cents": exit_value,
                 "realized_pnl_cents": realized,
-                "detail": detail,
+                "basis": "BROKER_EXIT_FILL",
             },
             decision_id=position.decision_id,
             symbol=position.symbol,
         )
+
+    def _exit_reason_for(self, client_order_id: str) -> ExitReason:
+        """Recover the reason recorded when the closing order was raised."""
+        for row in self.journal.transitions_for(client_order_id):
+            detail = str(row.get("detail") or "")
+            if not detail.startswith("exit requested: "):
+                continue
+            raw = detail.split(": ", 1)[1].strip()
+            for candidate in ExitReason:
+                if raw in (candidate.value, str(candidate)):
+                    return candidate
+        return ExitReason.MANUAL
+
+    def _market_is_open(self) -> bool:
+        """Whether the session is open, from the clock this cycle already read."""
+        return bool(self._clock is not None and self._clock.is_open)
+
+    def _expire_stale_exit_orders(self, now: datetime, report: CycleReport) -> None:
+        """Re-quote a closing order the market has walked away from.
+
+        An exit that never fills leaves real exposure unmanaged, which is the
+        same failure as never sending one. The order is cancelled, the cancel is
+        confirmed, and the position returns to management so the next cycle
+        prices it against the current chain. A partially filled exit is never
+        touched: cancelling one would strand the balance.
+        """
+        ttl = self.config.settings.exit_order_ttl_seconds
+        if ttl <= 0 or not self._market_is_open():
+            return
+
+        for row in self.journal.open_orders(kind=ORDER_KIND_EXIT):
+            if TradeState(str(row["state"])) is not TradeState.SUBMITTED:
+                continue
+            client_order_id = str(row["client_order_id"])
+            created = _parse_journal_ts(row.get("created_at"))
+            if created is None or (now - created).total_seconds() < ttl:
+                continue
+
+            try:
+                record = self.monitor.refresh(client_order_id)
+            except Exception as exc:
+                log.warning("exit sweep could not refresh %s: %s", client_order_id, exc)
+                continue
+            if record is None or record.broker_order_id is None:
+                continue
+            if record.filled_quantity > 0:
+                continue
+
+            try:
+                self.stack.broker.cancel_order(record.broker_order_id)
+            except BrokerError as exc:
+                log.warning("stale_exit_cancel_failed %s: %s", client_order_id, exc)
+                continue
+
+            confirmed = self.monitor.refresh(client_order_id)
+            after = self.journal.get_order(client_order_id)
+            released = after is not None and is_terminal(TradeState(str(after["state"])))
+            if confirmed is None or confirmed.filled_quantity > 0 or not released:
+                log.warning(
+                    "stale_exit_cancel_unconfirmed client_order_id=%s status=%s",
+                    client_order_id,
+                    confirmed.status if confirmed else "unknown",
+                )
+                continue
+
+            position_id = str(row["position_id"] or "")
+            if position_id:
+                self.journal.set_position_state(position_id, TradeState.MONITORING)
+            report.exit_orders_repriced += 1
+            log.info(
+                "stale_exit_order_retired client_order_id=%s position_id=%s "
+                "ttl_s=%d limit_price_cents=%s; will be re-quoted",
+                client_order_id,
+                position_id,
+                ttl,
+                row.get("limit_price_cents"),
+            )
+            self.journal.record_event(
+                "stale_exit_order_retired",
+                {
+                    "client_order_id": client_order_id,
+                    "position_id": position_id,
+                    "ttl_seconds": ttl,
+                },
+                symbol=str(row.get("symbol") or "") or None,
+            )
 
     def _record_rejection(
         self,

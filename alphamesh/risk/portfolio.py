@@ -28,6 +28,26 @@ class PortfolioState:
     broker_position_symbols: frozenset[str] = field(default_factory=frozenset)
     broker_working_symbols: frozenset[str] = field(default_factory=frozenset)
     broker_truth_available: bool = False
+    # Underlyings the broker holds that could not be resolved into a managed
+    # spread. Their risk is real but absent from every total below, so the
+    # aggregate caps would be computed against an understated portfolio.
+    unaccounted_broker_symbols: frozenset[str] = field(default_factory=frozenset)
+
+    @property
+    def exposure_fully_accounted(self) -> bool:
+        """Whether the risk totals here can be trusted as complete.
+
+        A broker position the agent could not resolve into a managed spread
+        carries risk that appears in no total below, so every aggregate cap
+        would be measured against an understated portfolio. That is a reason to
+        refuse new risk rather than a rounding detail.
+
+        Adoption is what keeps this true in the normal case: a spread the
+        broker holds is pulled into the journal before risk is computed, so it
+        is counted. This flag is the residue -- the spreads adoption could not
+        make sense of, which are the ones nothing else can see.
+        """
+        return self.broker_truth_available and not self.unaccounted_broker_symbols
 
     def has_working_order_for(self, symbol: str) -> bool:
         return symbol.upper() in {s.upper() for s in self.working_order_symbols}

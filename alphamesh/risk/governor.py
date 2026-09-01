@@ -182,6 +182,20 @@ class RiskGovernor:
                 ReasonCode.BROKER_WORKING_ORDER,
                 f"the broker already reports a working order in {decision.symbol}",
             )
+        # 6c. Exposure accounting. Every aggregate cap below is computed from
+        #     the positions this state carries. If the account holds a spread
+        #     that is not among them, those totals understate real risk, and
+        #     approving against them would size new exposure off a number known
+        #     to be wrong. Blocking is the only safe reading; exits are
+        #     unaffected, because closing a position never runs this gate.
+        if not portfolio.exposure_fully_accounted:
+            v.fail(
+                ReasonCode.BROKER_OPEN_POSITION,
+                (
+                    "broker exposure is not fully accounted for in portfolio risk; "
+                    "refusing new exposure until it is"
+                ),
+            )
         v.checks.append("broker_truth")
 
         # 7. Daily circuit breaker.
