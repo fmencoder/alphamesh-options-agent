@@ -31,7 +31,11 @@ from typing import Any
 from alphamesh import __version__
 from alphamesh.alpaca.cli_adapter import AlpacaCliAdapter
 from alphamesh.alpaca.client import build_stack
-from alphamesh.alpaca.market_data import LOOKBACK_CALENDAR_DAYS, CaptureMarketData
+from alphamesh.alpaca.market_data import (
+    LOOKBACK_CALENDAR_DAYS,
+    CaptureMarketData,
+    MarketDataUnavailableError,
+)
 from alphamesh.alpaca.mcp_adapter import describe_mcp_usage
 from alphamesh.analytics import build_report
 from alphamesh.config import AppConfig, load_config
@@ -445,12 +449,34 @@ def cmd_replay(config: AppConfig) -> int:
         orchestrator.startup()
         # Pin the clock just after the newest captured bar so the freshness
         # gates evaluate the captured quotes as current, exactly as they were.
-        latest = max(
-            orchestrator.stack.market_data.snapshot(
-                symbol, lookback_minutes=config.universe.bar_lookback_minutes
-            ).as_of
-            for symbol in config.universe.symbols
-        )
+        #
+        # The capture covers the symbols that were recorded, which is not
+        # necessarily the whole configured universe: the universe grew to eight
+        # symbols while the capture holds two. A replay is a walk over captured
+        # data, so an uncaptured symbol is simply absent here rather than a
+        # failure -- it is skipped and named. An empty capture is still an
+        # error, so the command keeps its value as a CI gate.
+        as_of: list[datetime] = []
+        missing: list[str] = []
+        for symbol in config.universe.symbols:
+            try:
+                as_of.append(
+                    orchestrator.stack.market_data.snapshot(
+                        symbol, lookback_minutes=config.universe.bar_lookback_minutes
+                    ).as_of
+                )
+            except MarketDataUnavailableError:
+                missing.append(symbol)
+        if not as_of:
+            print(
+                f"no captured bars for any universe symbol in "
+                f"{config.settings.capture_dir}",
+                file=sys.stderr,
+            )
+            return 4
+        if missing:
+            print(f"  NOT CAPTURED: {', '.join(missing)} (skipped)")
+        latest = max(as_of)
         pinned = latest.replace(tzinfo=UTC) + timedelta(seconds=30)
         print(f"  REPLAY AS-OF: {pinned.isoformat()} (pinned to captured data)\n")
         report = orchestrator.run_cycle(now=pinned)

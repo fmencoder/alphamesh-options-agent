@@ -1127,3 +1127,52 @@ class TestAdoptionSummaryPayload:
         assert payload["adopted"] == 0
         assert isinstance(payload["detail"], dict)
         assert len(payload["detail"]["ambiguous"]) == 1
+
+
+class TestReplayOverAPartialCapture:
+    """The capture holds the symbols that were recorded, not the whole universe.
+
+    The universe grew to eight symbols while the capture holds two, so `replay`
+    crashed on the first uncaptured symbol. CI has been red on that since the
+    universe change — which means the gate stopped catching anything, including
+    a real regression.
+    """
+
+    def _capture_config(self, config):  # type: ignore[no-untyped-def]
+        return config.model_copy(
+            update={
+                "settings": config.settings.model_copy(
+                    update={"data_source": "mcp_capture", "dry_run": True}
+                )
+            }
+        )
+
+    def test_replay_skips_uncaptured_symbols_and_succeeds(self, config, capsys) -> None:  # type: ignore[no-untyped-def]
+        from alphamesh.main import cmd_replay
+
+        # The full eight-symbol universe against a two-symbol capture.
+        assert len(config.universe.symbols) > 2
+
+        code = cmd_replay(self._capture_config(config))
+
+        assert code == 0
+        out = capsys.readouterr().out
+        assert "NOT CAPTURED" in out
+        assert "REPLAY AS-OF" in out
+
+    def test_replay_still_fails_when_nothing_is_captured(self, config) -> None:  # type: ignore[no-untyped-def]
+        """The gate keeps its teeth: an empty capture is still an error."""
+        from alphamesh.main import cmd_replay
+
+        empty = config.model_copy(
+            update={
+                "settings": config.settings.model_copy(
+                    update={"data_source": "mcp_capture", "dry_run": True}
+                ),
+                "universe": config.universe.model_copy(
+                    update={"symbols": ["NOTACAPTUREDSYMBOL"]}
+                ),
+            }
+        )
+
+        assert cmd_replay(empty) != 0
