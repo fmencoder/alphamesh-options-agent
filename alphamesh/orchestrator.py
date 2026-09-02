@@ -15,12 +15,13 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from alphamesh.agents.market_scout import MarketScout
 from alphamesh.agents.regime_agent import RegimeAgent
-from alphamesh.agents.strategy_agent import CouncilResult, StrategyAgent
+from alphamesh.agents.strategy_agent import StrategyAgent
 from alphamesh.alpaca.client import AlpacaStack
 from alphamesh.alpaca.execution import AmbiguousSubmissionError, BrokerError
 from alphamesh.alpaca.options import occ_underlying
@@ -39,6 +40,12 @@ from alphamesh.execution.monitor import (
     mark_spread_cents,
 )
 from alphamesh.execution.order_builder import build_exit_intent, build_order_intent
+from alphamesh.execution.ranking import (
+    WEIGHTS,
+    RankedCandidate,
+    rank_candidates,
+    score_opportunity,
+)
 from alphamesh.execution.recovery import reconcile_open_orders
 from alphamesh.execution.state_machine import is_terminal, transition
 from alphamesh.intelligence.reasoning import ReasoningProvider
@@ -566,9 +573,20 @@ class Orchestrator:
                 report.errors.append(f"portfolio_state: {exc}")
                 return report
 
-        # 4. Scan and decide.
+        # 4. Scan and decide. Deciding is split from allocating on purpose.
+        #
+        #    PASS 1 qualifies every candidate -- regime, council, chain,
+        #    deterministic contract selection, opportunity score -- and touches
+        #    no broker state at all: no reservation, no submission, no order id.
+        #    PASS 2 then offers capital in score order.
+        #
+        #    Before this split, the scout's sort order (quant score alone)
+        #    decided which candidate consumed the last open slot.
         scanned = self.scout.scan()
         report.symbols_scanned = len(scanned)
+
+        candidates: list[RankedCandidate] = []
+        unrankable: list[dict[str, object]] = []
 
         for snapshot, signal in scanned:
             regime = self.regime_agent.assess(snapshot, signal)
@@ -596,18 +614,68 @@ class Orchestrator:
                 self._record_rejection(
                     decision, (ReasonCode.DAILY_DRAWDOWN_LIMIT,), breaker.detail, report
                 )
+                unrankable.append(
+                    {
+                        "symbol": decision.symbol,
+                        "strategy": decision.strategy.value,
+                        "reason": "circuit_breaker_tripped",
+                    }
+                )
                 continue
 
             try:
-                self._attempt_entry(decision, council, portfolio, now, report)
+                candidate = self._qualify_candidate(decision, regime, portfolio, now, report)
             except Exception as exc:
-                log.exception("entry attempt failed for %s", decision.symbol)
+                log.exception("candidate qualification failed for %s", decision.symbol)
                 report.errors.append(f"{decision.symbol}: {exc}")
                 self.journal.record_event(
-                    "entry_error",
+                    "qualification_error",
                     {"error": str(exc)},
                     decision_id=decision.decision_id,
                     symbol=decision.symbol,
+                )
+                unrankable.append(
+                    {
+                        "symbol": decision.symbol,
+                        "strategy": decision.strategy.value,
+                        "reason": "qualification_error",
+                        "detail": str(exc),
+                    }
+                )
+                continue
+
+            if candidate is None:
+                # Reached AI approval but produced no spread to score. The
+                # reason codes are already journalled by contract_selection.
+                unrankable.append(
+                    {
+                        "symbol": decision.symbol,
+                        "strategy": decision.strategy.value,
+                        "reason": "no_eligible_spread",
+                    }
+                )
+                continue
+
+            candidates.append(candidate)
+
+        ranked = rank_candidates(candidates)
+        if ranked or unrankable:
+            self._record_ranking(now, ranked, unrankable)
+
+        # PASS 2. Sorted greedy: offer capital highest score first, and let the
+        # governor answer for each one independently. A rejection at the top of
+        # the list never stops the rest of the list from being considered.
+        for candidate in ranked:
+            try:
+                self._attempt_entry(candidate, portfolio, now, report)
+            except Exception as exc:
+                log.exception("entry attempt failed for %s", candidate.decision.symbol)
+                report.errors.append(f"{candidate.decision.symbol}: {exc}")
+                self.journal.record_event(
+                    "entry_error",
+                    {"error": str(exc)},
+                    decision_id=candidate.decision.decision_id,
+                    symbol=candidate.decision.symbol,
                 )
 
             # Re-read state so a fill inside this cycle counts against limits.
@@ -618,6 +686,42 @@ class Orchestrator:
 
         self.journal.record_event("cycle_complete", report.as_dict())
         return report
+
+    def _record_ranking(
+        self,
+        now: datetime,
+        ranked: Sequence[RankedCandidate],
+        unrankable: Sequence[dict[str, object]],
+    ) -> None:
+        """Journal one auditable record of how this cycle prioritised capital.
+
+        Written before any allocation is attempted, so it reflects the ordering
+        that was actually used rather than the outcome it produced.
+        """
+        payload = {
+            "cycle_ts": now.isoformat(),
+            "candidate_count": len(ranked),
+            "weights": dict(WEIGHTS),
+            "candidates": [
+                {
+                    "rank": index,
+                    "symbol": candidate.decision.symbol,
+                    "strategy": candidate.decision.strategy.value,
+                    **candidate.score.as_dict(),
+                }
+                for index, candidate in enumerate(ranked, start=1)
+            ],
+            "excluded": list(unrankable),
+        }
+        self.journal.record_event("opportunity_ranking", payload)
+        if ranked:
+            log.info(
+                "opportunity_ranking candidates=%d order=%s",
+                len(ranked),
+                ", ".join(
+                    f"{c.decision.symbol}:{c.score.total:.4f}" for c in ranked
+                ),
+            )
 
     # -------------------------------------------------------- stale orders
     def _expire_stale_entry_orders(self, now: datetime, report: CycleReport) -> None:
@@ -739,17 +843,26 @@ class Orchestrator:
             )
 
     # ---------------------------------------------------------------- entry
-    def _attempt_entry(
+    def _qualify_candidate(
         self,
         decision: TradeDecision,
-        council: CouncilResult,
+        regime: RegimeAssessment | None,
         portfolio: PortfolioState,
         now: datetime,
         report: CycleReport,
-    ) -> None:
-        state = transition(TradeState.DISCOVERED, TradeState.ANALYZED)
-        state = transition(state, TradeState.AI_APPROVED)
+    ) -> RankedCandidate | None:
+        """Build and score a candidate spread, WITHOUT touching broker state.
 
+        Everything here is read-only with respect to the account and the order
+        book: it pulls a chain, runs deterministic contract selection, journals
+        why selection went the way it did, and scores the result. It reserves
+        no client order id, submits nothing and approves nothing. That boundary
+        is what makes it safe to qualify every candidate before allocating to
+        any of them.
+
+        Returns ``None`` when no eligible spread could be built; the rejection
+        is recorded exactly as it was before this split.
+        """
         option_type = (
             OptionType.CALL
             if decision.strategy is Strategy.BULL_CALL_SPREAD
@@ -817,10 +930,39 @@ class Orchestrator:
                 selection.detail,
             )
             self._record_rejection(decision, codes, selection.detail, report)
-            return
+            return None
 
         spread = selection.spread
         report.contracts_selected += 1
+        return RankedCandidate(
+            decision=decision,
+            spread=spread,
+            regime=regime,
+            score=score_opportunity(
+                decision, spread, regime, portfolio, self.config.risk
+            ),
+        )
+
+    def _attempt_entry(
+        self,
+        candidate: RankedCandidate,
+        portfolio: PortfolioState,
+        now: datetime,
+        report: CycleReport,
+    ) -> None:
+        """Offer capital to one already-qualified candidate.
+
+        The ranker chose when this runs relative to its peers and has no
+        further say: from here the Risk Governor is the only authority, and it
+        re-checks both legs' quotes at approval time, which is what makes it
+        safe to have constructed the spread earlier in the cycle.
+        """
+        decision = candidate.decision
+        spread = candidate.spread
+
+        state = transition(TradeState.DISCOVERED, TradeState.ANALYZED)
+        state = transition(state, TradeState.AI_APPROVED)
+
         # The client order id must be known before the governor runs, so the
         # duplicate check sees the exact id we would submit.
         from alphamesh.execution.order_builder import build_client_order_id
