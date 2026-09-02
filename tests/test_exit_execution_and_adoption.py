@@ -1176,3 +1176,151 @@ class TestReplayOverAPartialCapture:
         )
 
         assert cmd_replay(empty) != 0
+
+
+class TestMlegCreditCloseSign:
+    """Alpaca mleg limit_price notation, end to end.
+
+    Trading API, CreateOrderRequest.limit_price: a POSITIVE value is a debit
+    (money paid), a NEGATIVE value is a credit (money received). Closing a long
+    debit vertical earns a credit, so the wire value must be negative. This
+    build submitted the positive magnitude, which asks Alpaca to PAY up to the
+    spread's full value to get out instead of receiving it.
+    """
+
+    def test_the_orchestrator_hands_the_broker_an_unsigned_magnitude(
+        self, spy_config
+    ) -> None:  # type: ignore[no-untyped-def]
+        """The caller contract the sign correction depends on."""
+        broker = SimulatedBroker(make_account())
+        orchestrator, journal, _ = build(spy_config, broker=broker)
+        open_one_position(orchestrator, journal)
+
+        orchestrator.run_cycle(now=flatten_window())
+
+        assert broker.close_payloads, "no closing order was raised"
+        magnitude = broker.close_payloads[0]["limit_price_cents"]
+        assert magnitude > 0, (
+            "the orchestrator must pass an unsigned credit magnitude; "
+            "the sign belongs to the wire layer alone"
+        )
+        journal.close()
+
+    def test_that_magnitude_reaches_the_wire_as_a_credit(
+        self, spy_config, monkeypatch
+    ) -> None:  # type: ignore[no-untyped-def]
+        """End to end: orchestrator magnitude -> real broker -> negative JSON."""
+        from alphamesh.alpaca.execution import AlpacaPaperBroker
+        from alphamesh.execution.order_builder import build_exit_intent
+
+        sim = SimulatedBroker(make_account())
+        orchestrator, journal, _ = build(spy_config, broker=sim)
+        position = open_one_position(orchestrator, journal)
+        orchestrator.run_cycle(now=flatten_window())
+        magnitude = sim.close_payloads[0]["limit_price_cents"]
+
+        # Feed the orchestrator's own number through the production broker and
+        # assert the exact JSON that would reach Alpaca.
+        chain = {
+            c.symbol: c
+            for c in CaptureOptionChain(CAPTURE_DIR).chain(
+                "SPY",
+                __import__("alphamesh.models.domain", fromlist=["x"]).OptionType.CALL,
+                NOW.date(),
+                0,
+                30,
+            )
+        }
+        intent = build_exit_intent(
+            position,
+            chain[position.long_symbol],
+            chain[position.short_symbol],
+            magnitude,
+            NOW,
+        )
+        real = AlpacaPaperBroker("k", "s")
+        captured: dict = {}
+        monkeypatch.setattr(
+            real,
+            "_request",
+            lambda m, p, **kw: (
+                captured.update(kw.get("json", {})),
+                {"id": "x", "status": "new"},
+            )[1],
+        )
+
+        real.close_spread(intent, magnitude, "alphamesh-SPY-BCSX-e2e")
+
+        assert float(captured["limit_price"]) < 0, (
+            "the closing order reached the wire as a DEBIT; it must be a credit"
+        )
+        assert abs(float(captured["limit_price"])) * 100 == magnitude
+        assert [leg["position_intent"] for leg in captured["legs"]] == [
+            "sell_to_close",
+            "buy_to_close",
+        ]
+        assert captured["order_class"] == "mleg"
+        journal.close()
+
+    def test_realised_pnl_is_correct_if_alpaca_echoes_the_negative_sign(
+        self, spy_config
+    ) -> None:  # type: ignore[no-untyped-def]
+        """The downstream consequence of submitting a negative limit.
+
+        Alpaca does not document whether filled_avg_price mirrors the mleg sign
+        convention. If it does, reading it as signed would book a $7.55 credit
+        as a $755 loss ON TOP of the entry debit -- fabricated P&L, the exact
+        defect this exit path was rewritten to remove. The money received is the
+        magnitude of the fill under either convention.
+        """
+        broker = SimulatedBroker(make_account())
+        orchestrator, journal, _ = build(spy_config, broker=broker)
+        position = open_one_position(orchestrator, journal)
+
+        broker.fill = False
+        orchestrator.run_cycle(now=flatten_window())
+        exit_id = broker.close_payloads[0]["client_order_id"]
+        credit_cents = broker.close_payloads[0]["limit_price_cents"]
+
+        # Alpaca reports the fill back with the credit notation.
+        broker.orders[exit_id] = broker.orders[exit_id].model_copy(
+            update={
+                "status": "filled",
+                "raw_status": "filled",
+                "filled_quantity": position.quantity,
+                "filled_avg_price_cents": -credit_cents,
+            }
+        )
+
+        orchestrator.run_cycle(now=flatten_window() + timedelta(minutes=1))
+
+        outcomes = journal.outcomes()
+        assert len(outcomes) == 1
+        expected_value = credit_cents * OPTION_MULTIPLIER * position.quantity
+        assert outcomes[0]["exit_value_cents"] == expected_value, (
+            "a negative fill price was read as signed and destroyed the P&L"
+        )
+        assert outcomes[0]["realized_pnl_cents"] == (
+            expected_value - position.entry_debit_cents
+        )
+        journal.close()
+
+    def test_realised_pnl_is_correct_if_alpaca_reports_a_positive_magnitude(
+        self, spy_config
+    ) -> None:  # type: ignore[no-untyped-def]
+        """The other convention. Both must produce the same money."""
+        broker = SimulatedBroker(make_account())
+        orchestrator, journal, _ = build(spy_config, broker=broker)
+        position = open_one_position(orchestrator, journal)
+
+        orchestrator.run_cycle(now=flatten_window())
+
+        outcomes = journal.outcomes()
+        assert len(outcomes) == 1
+        credit_cents = broker.close_payloads[0]["limit_price_cents"]
+        expected_value = credit_cents * OPTION_MULTIPLIER * position.quantity
+        assert outcomes[0]["exit_value_cents"] == expected_value
+        assert outcomes[0]["realized_pnl_cents"] == (
+            expected_value - position.entry_debit_cents
+        )
+        journal.close()

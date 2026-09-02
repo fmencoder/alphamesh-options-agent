@@ -149,7 +149,29 @@ class AlpacaPaperBroker:
     def close_spread(
         self, intent: OrderIntent, limit_price_cents: int, client_order_id: str
     ) -> ExecutionRecord:
-        """Submit the mirror-image order that flattens the spread."""
+        """Submit the mirror-image order that flattens the spread.
+
+        ``limit_price_cents`` is an UNSIGNED magnitude: the credit we expect to
+        receive for selling the spread back. Every caller passes it that way.
+
+        Alpaca's mleg notation is the opposite of the intuitive reading, and
+        getting it wrong is expensive. From the Trading API schema for
+        CreateOrderRequest.limit_price:
+
+            "In case of `mleg`, the limit_price parameter is expressed with the
+             following notation:
+             - A positive value indicates a debit, representing a cost or
+               payment to be made.
+             - A negative value signifies a credit, reflecting an amount to be
+               received."
+
+        Closing a long debit vertical earns a credit, so the wire value must be
+        NEGATIVE. Sending the positive magnitude -- as this did until now --
+        tells Alpaca "I will PAY up to $X to get out" when we mean "pay me $X",
+        which removes every bit of downside protection the limit exists to give.
+        Entries are unaffected: buy_to_open a debit spread genuinely IS a debit,
+        so ``to_alpaca_payload`` keeps its positive sign.
+        """
         import httpx
 
         flipped = []
@@ -173,7 +195,8 @@ class AlpacaPaperBroker:
             "qty": str(intent.quantity),
             "type": "limit",
             "time_in_force": "day",
-            "limit_price": f"{limit_price_cents / 100:.2f}",
+            # Negative = credit received. See the notation quoted above.
+            "limit_price": f"{-abs(limit_price_cents) / 100:.2f}",
             "client_order_id": client_order_id,
             "legs": flipped,
         }

@@ -1317,7 +1317,20 @@ class Orchestrator:
         Realised money is entry fill against exit fill. No mark, no estimate,
         no fallback: both sides are prices the broker actually traded.
         """
-        exit_price_cents = record.filled_avg_price_cents or 0
+        # The closing order is submitted as a NEGATIVE mleg limit price, because
+        # that is how Alpaca expresses a credit. Whether it echoes that sign back
+        # on filled_avg_price is NOT documented: the schema says only "Filled
+        # average price", and the one multi-leg example in the spec is a debit
+        # open. Every closing order this build can produce is a credit close --
+        # the limit is always a negated positive magnitude -- so the money
+        # received is the magnitude of the fill under either convention. Reading
+        # it as signed would book a fill of -7.55 as a $755 LOSS on top of the
+        # entry debit, which is precisely the fabricated-P&L failure this whole
+        # exit path was rewritten to eliminate.
+        #
+        # If a genuine net-DEBIT close is ever added, this must become signed:
+        # paying to close is real money out, and abs() would hide it.
+        exit_price_cents = abs(record.filled_avg_price_cents or 0)
         exit_value = exit_price_cents * OPTION_MULTIPLIER * record.filled_quantity
         realized = exit_value - position.entry_debit_cents
         holding = (now - position.opened_at).total_seconds() / 60.0

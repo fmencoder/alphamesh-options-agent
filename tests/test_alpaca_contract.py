@@ -124,6 +124,81 @@ class TestClosingPayload:
         for leg in captured["legs"]:
             assert leg["position_intent"] in POSITION_INTENT
 
+    def test_a_credit_close_is_submitted_as_a_negative_limit_price(
+        self, monkeypatch
+    ) -> None:  # type: ignore[no-untyped-def]
+        """Alpaca mleg notation: negative limit_price = credit received.
+
+        Sending the positive magnitude tells Alpaca "I will PAY up to $7.55 to
+        get out" when we mean "pay me $7.55". The order still fills, but with no
+        downside protection whatsoever -- the limit stops constraining the one
+        direction it exists to constrain.
+        """
+        from alphamesh.alpaca.execution import AlpacaPaperBroker
+
+        broker = AlpacaPaperBroker("k", "s")
+        captured: dict = {}
+        monkeypatch.setattr(
+            broker,
+            "_request",
+            lambda m, p, **kw: (
+                captured.update(kw.get("json", {})),
+                {"id": "x", "status": "new"},
+            )[1],
+        )
+        intent = build_order_intent(make_decision(), make_spread(), approved(), NOW)
+
+        broker.close_spread(intent, 755, "alphamesh-SPY-BCS-close")
+
+        assert captured["limit_price"] == "-7.55", (
+            "a credit close must be negative in Alpaca mleg notation"
+        )
+        assert float(captured["limit_price"]) < 0
+        # The magnitude is untouched; only the sign carries the direction.
+        assert abs(float(captured["limit_price"])) == 7.55
+        # And the rest of the contract is unchanged.
+        assert captured["order_class"] == "mleg"
+        assert captured["type"] == "limit"
+        assert captured["time_in_force"] == "day"
+
+    def test_an_unsigned_magnitude_is_never_double_negated(
+        self, monkeypatch
+    ) -> None:  # type: ignore[no-untyped-def]
+        """Callers pass an unsigned credit magnitude; the sign is applied once."""
+        from alphamesh.alpaca.execution import AlpacaPaperBroker
+
+        broker = AlpacaPaperBroker("k", "s")
+        captured: dict = {}
+        monkeypatch.setattr(
+            broker,
+            "_request",
+            lambda m, p, **kw: (
+                captured.update(kw.get("json", {})),
+                {"id": "x", "status": "new"},
+            )[1],
+        )
+        intent = build_order_intent(make_decision(), make_spread(), approved(), NOW)
+
+        # Even if a caller ever handed this a negative value, the wire result is
+        # a credit exactly once -- never flipped back to a debit.
+        broker.close_spread(intent, -755, "alphamesh-SPY-BCS-close")
+
+        assert captured["limit_price"] == "-7.55"
+
+    def test_the_entry_debit_limit_price_stays_positive(self) -> None:
+        """The other half of the notation: a debit open IS a positive limit."""
+        from alphamesh.execution.order_builder import to_alpaca_payload
+
+        intent = build_order_intent(make_decision(), make_spread(), approved(), NOW)
+        payload = to_alpaca_payload(intent)
+
+        assert float(payload["limit_price"]) > 0
+        assert payload["limit_price"] == f"{intent.limit_price_cents / 100:.2f}"
+        assert [leg["position_intent"] for leg in payload["legs"]] == [
+            "buy_to_open",
+            "sell_to_open",
+        ]
+
 
 class TestOrderStatusHandling:
     def test_every_documented_status_maps_to_a_valid_state(self) -> None:

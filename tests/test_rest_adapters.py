@@ -232,7 +232,11 @@ class TestPaperBrokerMapping:
             "sell_to_close",
             "buy_to_close",
         ]
-        assert captured["limit_price"] == "3.00"
+        # Negative because closing a long debit vertical earns a CREDIT, and
+        # Alpaca's mleg notation spells a credit with a negative limit_price.
+        # This assertion previously read "3.00", which encoded the defect: a
+        # positive value is a DEBIT, i.e. an offer to pay to get out.
+        assert captured["limit_price"] == "-3.00"
 
 
 class TestOptionChainDayVolumeRegression:
