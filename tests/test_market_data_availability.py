@@ -27,7 +27,7 @@ from alphamesh.config import Settings, load_config
 from alphamesh.main import _describe_data_error, cmd_preflight
 from alphamesh.models.domain import Bar
 from alphamesh.safety import GuardResult
-from tests.conftest import CAPTURE_DIR, make_account
+from tests.conftest import CAPTURE_DIR, PinnedCaptureOptionChain, make_account
 from tests.test_preflight import parse_flags
 
 # Friday 2026-08-28, the last completed session before the weekend.
@@ -113,7 +113,7 @@ def run_preflight(monkeypatch, capsys, market, tmp_path):  # type: ignore[no-unt
     stack = AlpacaStack(
         guard=GuardResult(paper=True, detail="test", checks=("ALPACA_PAPER=true",)),
         market_data=market,
-        option_chain=CaptureOptionChain(CAPTURE_DIR),
+        option_chain=PinnedCaptureOptionChain(CAPTURE_DIR),
         broker=broker,
         live_broker=False,
     )
@@ -407,3 +407,68 @@ class TestCaptureProviderParity:
 
         source = CaptureMarketData(CAPTURE_DIR)
         assert source.latest_bar("SPY").close == pytest.approx(769.34)
+
+
+class TestFixtureEvaluationIsCalendarIndependent:
+    """A captured snapshot must not decay into a failing test as time passes.
+
+    On 2026-09-02 five tests here went red with no code change: the committed
+    chain expires 2026-09-03, which had become 1 DTE against a min_dte of 2, so
+    the offline preflight saw an empty chain. The fixture was aging against the
+    wall clock. Production is right to measure DTE against the live clock; a
+    historical fixture simply must be evaluated at its own date.
+    """
+
+    def test_the_pinned_chain_ignores_the_calendar(self) -> None:
+        from datetime import date, timedelta
+
+        from alphamesh.models.domain import OptionType
+        from tests.conftest import TODAY, PinnedCaptureOptionChain
+
+        chain = PinnedCaptureOptionChain(CAPTURE_DIR)
+        baseline = [
+            c.symbol for c in chain.chain("SPY", OptionType.CALL, TODAY, 2, 10)
+        ]
+        assert baseline, "the capture must contain SPY calls at its own date"
+
+        # The same fixture, asked on wildly different days, answers identically.
+        for offset in (1, 2, 30, 365, 3650):
+            later = [
+                c.symbol
+                for c in chain.chain(
+                    "SPY", OptionType.CALL, TODAY + timedelta(days=offset), 2, 10
+                )
+            ]
+            assert later == baseline, f"chain drifted {offset} days after capture"
+        earlier = [
+            c.symbol
+            for c in chain.chain("SPY", OptionType.CALL, date(2020, 1, 1), 2, 10)
+        ]
+        assert earlier == baseline
+
+    def test_the_unpinned_chain_is_what_decayed(self) -> None:
+        """Proves the diagnosis rather than asserting it: the raw fixture ages."""
+        from datetime import timedelta
+
+        from alphamesh.models.domain import OptionType
+        from tests.conftest import TODAY
+
+        raw = CaptureOptionChain(CAPTURE_DIR)
+        at_capture = raw.chain("SPY", OptionType.CALL, TODAY, 2, 10)
+        assert at_capture, "sanity: the capture is populated at its own date"
+
+        # Far enough past the captured expirations, the window is empty. That is
+        # correct production behaviour and exactly why the test must pin.
+        assert raw.chain("SPY", OptionType.CALL, TODAY + timedelta(days=60), 2, 10) == []
+
+    def test_preflight_is_ready_at_the_fixture_date(
+        self, monkeypatch, capsys, tmp_path
+    ) -> None:  # type: ignore[no-untyped-def]
+        """The end the pin serves: a green gate that stays green tomorrow."""
+        code, flags, _out, _ = run_preflight(
+            monkeypatch, capsys, FakeMarketData(is_open=False), tmp_path
+        )
+        assert flags["PREFLIGHT_OPTIONS_CHAIN"] == "PASS"
+        assert flags["PREFLIGHT_GREEKS"] == "PASS"
+        assert flags["PREFLIGHT_READY"] == "YES"
+        assert code == 0

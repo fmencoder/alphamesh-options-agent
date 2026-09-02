@@ -28,7 +28,13 @@ def parse_flags(text: str) -> dict[str, str]:
 
 
 @pytest.fixture
-def preflight_config(tmp_path):  # type: ignore[no-untyped-def]
+def preflight_config(tmp_path, pin_capture_chain_to_fixture_date):  # type: ignore[no-untyped-def]
+    """A healthy offline configuration, evaluated at the capture's own date.
+
+    ``cmd_preflight`` builds its own stack, so the chain is pinned through
+    ``build_stack`` rather than injected here. Without that pin this fixture's
+    result depends on what day the suite happens to run.
+    """
     return _captured_universe(load_config(
         settings=Settings(
             paper=True,

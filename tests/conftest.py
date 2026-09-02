@@ -64,6 +64,54 @@ def now() -> datetime:
     return NOW
 
 
+class PinnedCaptureOptionChain:
+    """A capture chain whose evaluation date is the capture's own market date.
+
+    The committed option snapshots are a photograph of 2026-08-28, with
+    expirations on 2026-09-03 and 2026-09-04. Production correctly measures DTE
+    against the wall clock, so as real time advances those fixed expirations
+    drift out of the configured 2-10 DTE window and eventually vanish from the
+    chain entirely. Any test that drives the real preflight over this fixture
+    therefore passes or fails depending on the calendar date it is run, which
+    is not a property a test suite may have: it went red overnight on 2026-09-02
+    with no code change, because 2026-09-03 became 1 DTE against a min_dte of 2.
+
+    Substituting the fixture's own date makes a historical snapshot behave like
+    the day it was taken. Nothing about production DTE handling changes -- the
+    live chain is still measured against the live clock -- and no gate is
+    relaxed: a symbol genuinely absent from the capture still fails, which is
+    what the surrounding tests rely on.
+    """
+
+    def __init__(self, capture_dir: Path, as_of: date = TODAY) -> None:
+        self._inner = CaptureOptionChain(capture_dir)
+        self._as_of = as_of
+
+    def chain(
+        self,
+        underlying: str,
+        option_type: OptionType,
+        as_of: date,
+        min_dte: int,
+        max_dte: int,
+    ) -> list[OptionContractCandidate]:
+        # The caller's as_of is deliberately discarded: it is the wall clock,
+        # and the whole point is that this fixture predates it.
+        return self._inner.chain(underlying, option_type, self._as_of, min_dte, max_dte)
+
+
+@pytest.fixture
+def pin_capture_chain_to_fixture_date(monkeypatch):  # type: ignore[no-untyped-def]
+    """Make ``build_stack`` hand out a date-pinned capture chain.
+
+    Used by the tests that drive the real ``cmd_preflight``, which builds its own
+    stack internally and so cannot be given a provider directly.
+    """
+    monkeypatch.setattr(
+        "alphamesh.alpaca.client.CaptureOptionChain", PinnedCaptureOptionChain
+    )
+
+
 @pytest.fixture
 def capture_chain() -> CaptureOptionChain:
     return CaptureOptionChain(CAPTURE_DIR)

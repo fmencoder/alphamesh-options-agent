@@ -1324,3 +1324,71 @@ class TestMlegCreditCloseSign:
             expected_value - position.entry_debit_cents
         )
         journal.close()
+
+
+class TestCreditCloseOnlyInvariant:
+    """The precondition that makes magnitude-based exit accounting correct.
+
+    ``_finalise_exit`` reads the broker's closing fill as a MAGNITUDE, which is
+    only sound because every close this build can construct receives a credit.
+    That rests on two structural facts, asserted here rather than assumed:
+
+      * both tradable strategies are long debit verticals, so a spread's value
+        lives in [0, width) and selling it back can only bring money in;
+      * the exit limit is max(1, long_mid - short_mid), always positive, and
+        the wire layer negates it into a credit exactly once.
+
+    If a net-debit closing path is ever added -- paying to remove a spread the
+    market will not take for free -- this invariant breaks and realised-P&L
+    accounting must be redesigned to distinguish CASH RECEIVED from CASH PAID.
+    abs() is not a general net-price representation and must not be treated as
+    one. These tests fail loudly the moment that assumption stops holding.
+    """
+
+    def test_every_tradable_strategy_is_a_long_debit_vertical(self) -> None:
+        from alphamesh.models.domain import TRADABLE_STRATEGIES
+
+        assert frozenset(
+            {Strategy.BULL_CALL_SPREAD, Strategy.BEAR_PUT_SPREAD}
+        ) == TRADABLE_STRATEGIES, (
+            "a new strategy was added; if it can close for a net debit, the "
+            "magnitude-based exit accounting in _finalise_exit is no longer valid"
+        )
+
+    def test_a_debit_spread_can_never_be_worth_more_than_its_width(
+        self, spy_config, now
+    ) -> None:  # type: ignore[no-untyped-def]
+        """Why the close is always a credit: value is bounded by [0, width)."""
+        from alphamesh.models.domain import OptionType
+        from alphamesh.strategies.bull_call import build_bull_call_spread
+
+        chain = CaptureOptionChain(CAPTURE_DIR).chain(
+            "SPY", OptionType.CALL, now.date(),
+            spy_config.strategies.min_dte, spy_config.strategies.max_dte,
+        )
+        selection = build_bull_call_spread(
+            "SPY", chain, spy_config.strategies, spy_config.risk, now,
+            as_of_date=now.date(),
+        )
+        assert selection.spread is not None
+        spread = selection.spread
+        assert 0 < spread.net_debit_cents < spread.strike_width_cents
+        assert 0 < spread.limit_price_cents < spread.strike_width_cents
+
+    def test_the_exit_limit_handed_to_the_broker_is_always_positive(
+        self, spy_config
+    ) -> None:  # type: ignore[no-untyped-def]
+        """No constructible close asks the broker for a debit."""
+        broker = SimulatedBroker(make_account())
+        orchestrator, journal, _ = build(spy_config, broker=broker)
+        open_one_position(orchestrator, journal)
+
+        orchestrator.run_cycle(now=flatten_window())
+
+        assert broker.close_payloads
+        for payload in broker.close_payloads:
+            assert payload["limit_price_cents"] > 0, (
+                "a non-positive exit magnitude would mean a net-debit close, "
+                "which the magnitude-based P&L accounting cannot represent"
+            )
+        journal.close()
