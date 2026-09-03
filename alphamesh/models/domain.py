@@ -88,6 +88,23 @@ TERMINAL_STATES: frozenset[TradeState] = frozenset(
     {TradeState.CLOSED, TradeState.REJECTED, TradeState.FAILED}
 )
 
+# States in which an order is still live at the broker and can still create
+# exposure by itself. This is deliberately NOT "every non-terminal state":
+# FILLED and MONITORING mean the order is done and whatever exposure it created
+# is now carried by the position record and by the account, both of which the
+# Risk Governor gates separately. Counting those as working orders locked every
+# symbol that had ever completed a round trip out of trading for the life of
+# the journal, because closing a position retires the exit order and leaves the
+# entry order sitting in MONITORING forever.
+WORKING_ORDER_STATES: frozenset[TradeState] = frozenset(
+    {
+        TradeState.CONSTRUCTED,
+        TradeState.SUBMITTED,
+        TradeState.PARTIALLY_FILLED,
+        TradeState.EXIT_REQUESTED,
+    }
+)
+
 
 class ReasonCode(StrEnum):
     """Machine-readable outcome codes. Every rejection carries at least one."""
@@ -474,6 +491,7 @@ __all__ = [
     "OPTION_MULTIPLIER",
     "TERMINAL_STATES",
     "TRADABLE_STRATEGIES",
+    "WORKING_ORDER_STATES",
     "AIArgument",
     "Bar",
     "Direction",

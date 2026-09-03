@@ -51,6 +51,7 @@ from alphamesh.execution.state_machine import is_terminal, transition
 from alphamesh.intelligence.reasoning import ReasoningProvider
 from alphamesh.models.domain import (
     OPTION_MULTIPLIER,
+    WORKING_ORDER_STATES,
     ExecutionRecord,
     ExitReason,
     OptionContractCandidate,
@@ -93,6 +94,18 @@ def _parse_journal_ts(raw: object) -> datetime | None:
     except ValueError:
         return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _is_working_order_state(raw: object) -> bool:
+    """Is this journal order still live enough to hold a symbol's duplicate lock?
+
+    An unrecognised state is treated as working: refusing new exposure on a row
+    we cannot read is the safe direction.
+    """
+    try:
+        return TradeState(str(raw)) in WORKING_ORDER_STATES
+    except ValueError:
+        return True
 
 
 @dataclass
@@ -382,7 +395,9 @@ class Orchestrator:
         unrealized = self._unrealized_pnl_cents(positions, now)
         today = (now or datetime.now(UTC)).date().isoformat()
         journal_working = frozenset(
-            str(o["symbol"]) for o in self.journal.open_orders() if o.get("symbol")
+            str(o["symbol"])
+            for o in self.journal.open_orders()
+            if o.get("symbol") and _is_working_order_state(o.get("state"))
         )
         broker_positions, broker_working, broker_ok = self._broker_exposure()
         journal_exposed = {p.symbol.upper() for p in positions} | {
